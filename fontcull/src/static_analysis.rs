@@ -11,7 +11,6 @@ type CssVariables = HashMap<String, String>;
 
 /// A parsed @font-face rule
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // weight and style reserved for font-weight matching
 pub struct FontFace {
     /// The font-family name declared in @font-face
     pub family: String,
@@ -23,83 +22,135 @@ pub struct FontFace {
     pub style: Option<String>,
 }
 
+/// Identifies a font variant: family + weight + style.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FontVariantKey {
+    /// Font family name (e.g. "PT Sans")
+    pub family: String,
+    /// Numeric font weight (e.g. 400, 700)
+    pub weight: u16,
+    /// Font style: "normal" or "italic"
+    pub style: String,
+}
+
 /// Result of analyzing CSS for font information
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FontAnalysis {
-    /// Map of font-family name -> characters used
+    /// Map of font-family name -> characters used (all variants combined)
     pub chars_per_font: HashMap<String, HashSet<char>>,
+    /// Map of (family, weight, style) -> characters used with that specific variant
+    pub chars_per_font_variant: HashMap<FontVariantKey, HashSet<char>>,
     /// Parsed @font-face rules
     pub font_faces: Vec<FontFace>,
 }
 
 /// Analyze HTML and CSS to collect font usage information
 pub fn analyze_fonts(html: &str, css: &str) -> FontAnalysis {
-    let chars_per_font = collect_chars_per_font(html, css);
+    let (chars_per_font, chars_per_font_variant) = collect_chars_per_font(html, css);
     let font_faces = parse_font_face_rules(css);
 
     FontAnalysis {
         chars_per_font,
+        chars_per_font_variant,
         font_faces,
     }
 }
 
 /// Extracts all text content and maps it to font-families based on CSS rules.
 ///
-/// Returns a map of font-family name -> set of characters used with that font.
-pub fn collect_chars_per_font(html: &str, css: &str) -> HashMap<String, HashSet<char>> {
+/// Returns both:
+/// - A map of font-family name -> set of characters (all variants combined)
+/// - A map of (family, weight, style) -> set of characters per variant
+pub fn collect_chars_per_font(
+    html: &str,
+    css: &str,
+) -> (
+    HashMap<String, HashSet<char>>,
+    HashMap<FontVariantKey, HashSet<char>>,
+) {
     let document = Html::parse_document(html);
 
     // First, parse CSS custom properties (variables)
     let css_vars = parse_css_custom_properties(css);
 
-    // Parse font-family rules with variable resolution
-    let font_rules = parse_font_family_rules_with_vars(css, &css_vars);
+    // Parse font style rules with variable resolution
+    let font_rules = parse_font_style_rules_with_vars(css, &css_vars);
 
-    let mut result: HashMap<String, HashSet<char>> = HashMap::new();
+    let mut per_family: HashMap<String, HashSet<char>> = HashMap::new();
+    let mut per_variant: HashMap<FontVariantKey, HashSet<char>> = HashMap::new();
 
     // For each element with text, determine which font-family applies
     // by checking CSS rules in order of specificity (simplified: last match wins)
     let all_elements = Selector::parse("*").unwrap();
 
     for element in document.select(&all_elements) {
-        // Get direct text content (not from children)
+        // Get all direct text nodes (not from children)
         let text: String = element
-            .text()
-            .next()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+            .children()
+            .filter_map(|child| child.value().as_text().map(|t| t.to_string()))
+            .collect();
 
         if text.trim().is_empty() {
             continue;
         }
 
-        // Find which font-family applies to this element
-        let font_family = find_font_family_for_element(&element, &font_rules)
-            .unwrap_or_else(|| "sans-serif".to_string());
+        // Find which font styling applies to this element
+        let resolved = find_font_style_for_element(&element, &font_rules);
 
-        // Add characters to that font's set
-        let chars = result.entry(font_family).or_default();
+        // Add characters to the per-family map
+        let family_chars = per_family.entry(resolved.font_family.clone()).or_default();
         for c in text.chars() {
-            chars.insert(c);
+            family_chars.insert(c);
+        }
+
+        // Add characters to the per-variant map
+        let key = FontVariantKey {
+            family: resolved.font_family,
+            weight: resolved.font_weight,
+            style: resolved.font_style,
+        };
+        let variant_chars = per_variant.entry(key).or_default();
+        for c in text.chars() {
+            variant_chars.insert(c);
         }
     }
 
-    result
+    (per_family, per_variant)
 }
 
-/// A CSS rule that sets font-family
-#[derive(Debug)]
-struct FontFamilyRule {
-    selector: String,
+/// Resolved font styling for an element.
+struct ResolvedFontStyle {
     font_family: String,
+    font_weight: u16,
+    font_style: String,
 }
 
-/// Parse CSS and extract rules that set font-family, with CSS variable resolution
-fn parse_font_family_rules_with_vars(css: &str, css_vars: &CssVariables) -> Vec<FontFamilyRule> {
+/// A CSS rule that sets font properties
+#[derive(Debug)]
+struct FontStyleRule {
+    selector: String,
+    font_family: Option<String>,
+    font_weight: Option<u16>,
+    font_style: Option<String>,
+}
+
+/// Parse a CSS font-weight value to a numeric weight.
+/// Handles named weights and numeric values.
+fn parse_font_weight(value: &str) -> Option<u16> {
+    match value.trim().to_lowercase().as_str() {
+        "normal" => Some(400),
+        "bold" => Some(700),
+        "lighter" => Some(100), // simplified — depends on inherited weight
+        "bolder" => Some(700),  // simplified — depends on inherited weight
+        other => other.parse().ok(),
+    }
+}
+
+/// Parse CSS and extract rules that set font-family, font-weight, or font-style,
+/// with CSS variable resolution.
+fn parse_font_style_rules_with_vars(css: &str, css_vars: &CssVariables) -> Vec<FontStyleRule> {
     let mut rules = Vec::new();
 
-    // Simple CSS parser - find rule blocks and extract font-family
-    // This is a simplified parser that handles basic cases
     let chars = css.chars().peekable();
     let mut current_selector = String::new();
     let mut in_block = false;
@@ -112,13 +163,19 @@ fn parse_font_family_rules_with_vars(css: &str, css_vars: &CssVariables) -> Vec<
         } else if c == '}' {
             in_block = false;
 
-            // Parse the block content for font-family
-            if let Some(font_family) = extract_font_family_with_vars(&block_content, css_vars) {
+            let font_family = extract_font_family_with_vars(&block_content, css_vars);
+            let font_weight = extract_font_weight_with_vars(&block_content, css_vars);
+            let font_style = extract_font_style_with_vars(&block_content, css_vars);
+
+            // Only add a rule if it sets at least one font property
+            if font_family.is_some() || font_weight.is_some() || font_style.is_some() {
                 let selector = current_selector.trim().to_string();
                 if !selector.is_empty() && !selector.starts_with('@') {
-                    rules.push(FontFamilyRule {
+                    rules.push(FontStyleRule {
                         selector,
                         font_family,
+                        font_weight,
+                        font_style,
                     });
                 }
             }
@@ -132,6 +189,83 @@ fn parse_font_family_rules_with_vars(css: &str, css_vars: &CssVariables) -> Vec<
     }
 
     rules
+}
+
+/// Extract font-weight value from a CSS declaration block, with CSS variable resolution.
+fn extract_font_weight_with_vars(block: &str, css_vars: &CssVariables) -> Option<u16> {
+    for declaration in block.split(';') {
+        let declaration = declaration.trim();
+        if let Some(value) = declaration.strip_prefix("font-weight:") {
+            let resolved = resolve_css_var(value.trim(), css_vars);
+            return parse_font_weight(&resolved);
+        }
+    }
+    None
+}
+
+/// Extract font-style value from a CSS declaration block, with CSS variable resolution.
+fn extract_font_style_with_vars(block: &str, css_vars: &CssVariables) -> Option<String> {
+    for declaration in block.split(';') {
+        let declaration = declaration.trim();
+        if let Some(value) = declaration.strip_prefix("font-style:") {
+            let resolved = resolve_css_var(value.trim(), css_vars);
+            let style = resolved.trim().to_lowercase();
+            if style == "normal" || style == "italic" || style == "oblique" {
+                return Some(style);
+            }
+        }
+    }
+    None
+}
+
+/// Find the resolved font styling for an element by checking CSS rules and inheritance.
+fn find_font_style_for_element(
+    element: &scraper::ElementRef,
+    rules: &[FontStyleRule],
+) -> ResolvedFontStyle {
+    // Collect the full ancestor chain (element itself + parents), nearest first
+    let mut chain: Vec<scraper::ElementRef> = Vec::new();
+    chain.push(*element);
+    for ancestor in element.ancestors() {
+        if let Some(el) = scraper::ElementRef::wrap(ancestor) {
+            chain.push(el);
+        }
+    }
+
+    // Resolve inherited font properties by walking from root to element.
+    // Later (more specific) rules override earlier ones.
+    let mut font_family = "sans-serif".to_string();
+    let mut font_weight: u16 = 400;
+    let mut font_style = "normal".to_string();
+
+    // Walk from root ancestor down to element (reverse of chain)
+    for el in chain.iter().rev() {
+        for rule in rules {
+            if let Ok(selector) = Selector::parse(&rule.selector) {
+                if selector.matches(el) {
+                    if let Some(ref ff) = rule.font_family {
+                        font_family = ff.clone();
+                    }
+                    if let Some(fw) = rule.font_weight {
+                        font_weight = fw;
+                    }
+                    if let Some(ref fs) = rule.font_style {
+                        font_style = fs.clone();
+                    }
+                }
+            }
+        }
+
+        // Also check for HTML elements that imply weight/style
+        let tag = el.value().name();
+        match tag {
+            "b" | "strong" => font_weight = 700,
+            "i" | "em" | "cite" | "dfn" => font_style = "italic".to_string(),
+            _ => {}
+        }
+    }
+
+    ResolvedFontStyle { font_family, font_weight, font_style }
 }
 
 /// Extract font-family value from a CSS declaration block, with CSS variable resolution
@@ -399,45 +533,6 @@ fn parse_css_custom_properties(css: &str) -> CssVariables {
     vars
 }
 
-/// Find which font-family applies to an element based on CSS rules
-fn find_font_family_for_element(
-    element: &scraper::ElementRef,
-    rules: &[FontFamilyRule],
-) -> Option<String> {
-    let mut matched_font: Option<String> = None;
-
-    // Check each rule (later rules override earlier ones - simplified specificity)
-    for rule in rules {
-        if let Ok(selector) = Selector::parse(&rule.selector) {
-            // Check if this element matches the selector
-            if selector.matches(element) {
-                matched_font = Some(rule.font_family.clone());
-            }
-        }
-    }
-
-    // If no direct match, check ancestors (font-family is inherited)
-    if matched_font.is_none() {
-        for ancestor in element.ancestors() {
-            if let Some(ancestor_el) = scraper::ElementRef::wrap(ancestor) {
-                for rule in rules {
-                    if let Ok(selector) = Selector::parse(&rule.selector)
-                        && selector.matches(&ancestor_el)
-                    {
-                        matched_font = Some(rule.font_family.clone());
-                        // Don't break - later rules still override
-                    }
-                }
-            }
-            if matched_font.is_some() {
-                break;
-            }
-        }
-    }
-
-    matched_font
-}
-
 /// Extract CSS from HTML document (from `<style>` tags and inline styles)
 pub fn extract_css_from_html(html: &str) -> String {
     let document = Html::parse_document(html);
@@ -465,12 +560,12 @@ mod tests {
             .code { font-family: monospace; }
         "#;
 
-        let rules = parse_font_family_rules_with_vars(css, &HashMap::new());
+        let rules = parse_font_style_rules_with_vars(css, &HashMap::new());
         assert_eq!(rules.len(), 3);
         assert_eq!(rules[0].selector, "body");
-        assert_eq!(rules[0].font_family, "Inter");
-        assert_eq!(rules[1].font_family, "Playfair Display");
-        assert_eq!(rules[2].font_family, "monospace");
+        assert_eq!(rules[0].font_family.as_deref(), Some("Inter"));
+        assert_eq!(rules[1].font_family.as_deref(), Some("Playfair Display"));
+        assert_eq!(rules[2].font_family.as_deref(), Some("monospace"));
     }
 
     #[test]
@@ -489,7 +584,7 @@ mod tests {
         "#;
 
         let css = extract_css_from_html(html);
-        let chars = collect_chars_per_font(html, &css);
+        let (chars, _) = collect_chars_per_font(html, &css);
 
         assert!(chars.contains_key("TestFont"));
         let test_font_chars = &chars["TestFont"];
@@ -517,7 +612,7 @@ mod tests {
         "#;
 
         let css = extract_css_from_html(html);
-        let chars = collect_chars_per_font(html, &css);
+        let (chars, _) = collect_chars_per_font(html, &css);
 
         // h1 should use HeadingFont
         assert!(chars.contains_key("HeadingFont"));
@@ -601,6 +696,101 @@ mod tests {
         let chars = &analysis.chars_per_font["MyFont"];
         assert!(chars.contains(&'H'));
         assert!(chars.contains(&'W'));
+    }
+
+    #[test]
+    fn test_per_variant_chars() {
+        let html = r#"
+            <html>
+            <head>
+                <style>
+                    body { font-family: "TestFont"; font-weight: 400; }
+                    h1 { font-weight: 700; }
+                    em { font-style: italic; }
+                </style>
+            </head>
+            <body>
+                <h1>Bold</h1>
+                <p>Normal <em>italic</em></p>
+            </body>
+            </html>
+        "#;
+
+        let css = extract_css_from_html(html);
+        let analysis = analyze_fonts(html, &css);
+
+        // Per-family map should have all chars under "TestFont"
+        let all_chars = &analysis.chars_per_font["TestFont"];
+        assert!(all_chars.contains(&'B')); // from "Bold"
+        assert!(all_chars.contains(&'N')); // from "Normal "
+        assert!(all_chars.contains(&'i')); // from "italic"
+
+        // Per-variant map should separate by weight/style
+        let normal_400 = &analysis.chars_per_font_variant[&FontVariantKey {
+            family: "TestFont".to_string(),
+            weight: 400,
+            style: "normal".to_string(),
+        }];
+        assert!(normal_400.contains(&'N'), "400 normal should have 'N' from 'Normal '");
+        assert!(!normal_400.contains(&'B'), "400 normal should NOT have 'B' from bold h1");
+
+        let bold_700 = &analysis.chars_per_font_variant[&FontVariantKey {
+            family: "TestFont".to_string(),
+            weight: 700,
+            style: "normal".to_string(),
+        }];
+        assert!(bold_700.contains(&'B'), "700 normal should have 'B' from 'Bold'");
+
+        let italic_400 = &analysis.chars_per_font_variant[&FontVariantKey {
+            family: "TestFont".to_string(),
+            weight: 400,
+            style: "italic".to_string(),
+        }];
+        assert!(italic_400.contains(&'i'), "400 italic should have 'i' from 'italic'");
+    }
+
+    #[test]
+    fn test_per_variant_html_bold_italic_tags() {
+        let html = r#"
+            <html>
+            <head>
+                <style>
+                    body { font-family: "MyFont"; }
+                </style>
+            </head>
+            <body>
+                <p>Normal <b>bold</b> <i>italic</i> <strong>strong</strong></p>
+            </body>
+            </html>
+        "#;
+
+        let css = extract_css_from_html(html);
+        let analysis = analyze_fonts(html, &css);
+
+        // <b> and <strong> should be weight 700
+        let bold = &analysis.chars_per_font_variant[&FontVariantKey {
+            family: "MyFont".to_string(),
+            weight: 700,
+            style: "normal".to_string(),
+        }];
+        assert!(bold.contains(&'b'), "bold variant should have 'b' from <b>bold</b>");
+        assert!(bold.contains(&'s'), "bold variant should have 's' from <strong>strong</strong>");
+
+        // <i> should be italic
+        let italic = &analysis.chars_per_font_variant[&FontVariantKey {
+            family: "MyFont".to_string(),
+            weight: 400,
+            style: "italic".to_string(),
+        }];
+        assert!(italic.contains(&'i'), "italic variant should have 'i' from <i>italic</i>");
+
+        // Normal text
+        let normal = &analysis.chars_per_font_variant[&FontVariantKey {
+            family: "MyFont".to_string(),
+            weight: 400,
+            style: "normal".to_string(),
+        }];
+        assert!(normal.contains(&'N'), "normal variant should have 'N' from 'Normal '");
     }
 
     #[test]
@@ -728,13 +918,13 @@ mod tests {
         "#;
 
         let vars = parse_css_custom_properties(css);
-        let rules = parse_font_family_rules_with_vars(css, &vars);
+        let rules = parse_font_style_rules_with_vars(css, &vars);
 
         // Should have 3 rules (h1, h2, p)
         assert_eq!(rules.len(), 3);
-        assert_eq!(rules[0].font_family, "Playfair Display");
-        assert_eq!(rules[1].font_family, "Playfair Display");
-        assert_eq!(rules[2].font_family, "Inter");
+        assert_eq!(rules[0].font_family.as_deref(), Some("Playfair Display"));
+        assert_eq!(rules[1].font_family.as_deref(), Some("Playfair Display"));
+        assert_eq!(rules[2].font_family.as_deref(), Some("Inter"));
     }
 }
 
@@ -756,9 +946,9 @@ mod unicode_tests {
         let vars = parse_css_custom_properties(css);
         assert_eq!(vars.get("--日本語"), Some(&"'Noto Sans JP'".to_string()));
 
-        let rules = parse_font_family_rules_with_vars(css, &vars);
+        let rules = parse_font_style_rules_with_vars(css, &vars);
         assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].font_family, "Noto Sans JP");
+        assert_eq!(rules[0].font_family.as_deref(), Some("Noto Sans JP"));
     }
 
     #[test]
@@ -773,8 +963,8 @@ mod unicode_tests {
         "#;
 
         let vars = parse_css_custom_properties(css);
-        let rules = parse_font_family_rules_with_vars(css, &vars);
-        assert_eq!(rules[0].font_family, "日本語フォント");
+        let rules = parse_font_style_rules_with_vars(css, &vars);
+        assert_eq!(rules[0].font_family.as_deref(), Some("日本語フォント"));
     }
 
     #[test]
@@ -790,8 +980,8 @@ mod unicode_tests {
         "#;
 
         let vars = parse_css_custom_properties(css);
-        let rules = parse_font_family_rules_with_vars(css, &vars);
-        assert_eq!(rules[0].font_family, "Test");
+        let rules = parse_font_style_rules_with_vars(css, &vars);
+        assert_eq!(rules[0].font_family.as_deref(), Some("Test"));
     }
 
     #[test]
@@ -806,8 +996,8 @@ mod unicode_tests {
         "#;
 
         let vars = parse_css_custom_properties(css);
-        let rules = parse_font_family_rules_with_vars(css, &vars);
-        assert_eq!(rules[0].font_family, "🎉 Party Font");
+        let rules = parse_font_style_rules_with_vars(css, &vars);
+        assert_eq!(rules[0].font_family.as_deref(), Some("🎉 Party Font"));
     }
 
     #[test]
@@ -819,8 +1009,8 @@ mod unicode_tests {
         "#;
 
         let vars = parse_css_custom_properties(css);
-        let rules = parse_font_family_rules_with_vars(css, &vars);
-        assert_eq!(rules[0].font_family, "日本語フォント");
+        let rules = parse_font_style_rules_with_vars(css, &vars);
+        assert_eq!(rules[0].font_family.as_deref(), Some("日本語フォント"));
     }
 
     #[test]
@@ -836,8 +1026,8 @@ mod unicode_tests {
         "#;
 
         let vars = parse_css_custom_properties(css);
-        let rules = parse_font_family_rules_with_vars(css, &vars);
-        assert_eq!(rules[0].font_family, "日本語");
+        let rules = parse_font_style_rules_with_vars(css, &vars);
+        assert_eq!(rules[0].font_family.as_deref(), Some("日本語"));
     }
 
     #[test]
@@ -848,10 +1038,10 @@ mod unicode_tests {
             }
         "#;
 
-        let rules = parse_font_family_rules_with_vars(css, &HashMap::new());
+        let rules = parse_font_style_rules_with_vars(css, &HashMap::new());
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].selector, ".日本語-class");
-        assert_eq!(rules[0].font_family, "Test Font");
+        assert_eq!(rules[0].font_family.as_deref(), Some("Test Font"));
     }
 
     #[test]
@@ -885,8 +1075,8 @@ mod unicode_tests {
         assert_eq!(vars.get("--primary"), Some(&"'Helvetica'".to_string()));
         assert_eq!(vars.get("--日本語"), Some(&"'Noto Sans JP'".to_string()));
 
-        let rules = parse_font_family_rules_with_vars(css, &vars);
-        assert_eq!(rules[0].font_family, "Helvetica");
+        let rules = parse_font_style_rules_with_vars(css, &vars);
+        assert_eq!(rules[0].font_family.as_deref(), Some("Helvetica"));
     }
 
     #[test]
@@ -906,7 +1096,7 @@ mod unicode_tests {
         "#;
 
         let css = extract_css_from_html(html);
-        let chars = collect_chars_per_font(html, &css);
+        let (chars, _) = collect_chars_per_font(html, &css);
 
         assert!(chars.contains_key("TestFont"));
         let font_chars = &chars["TestFont"];
@@ -1001,8 +1191,8 @@ mod unicode_tests {
         let vars = parse_css_custom_properties(css);
         assert_eq!(vars.get("--emoji"), Some(&"'😀🎉🚀'".to_string()));
 
-        let rules = parse_font_family_rules_with_vars(css, &vars);
-        assert_eq!(rules[0].font_family, "😀🎉🚀");
+        let rules = parse_font_style_rules_with_vars(css, &vars);
+        assert_eq!(rules[0].font_family.as_deref(), Some("😀🎉🚀"));
     }
 
     #[test]
@@ -1018,7 +1208,7 @@ mod unicode_tests {
         "#;
 
         let vars = parse_css_custom_properties(css);
-        let rules = parse_font_family_rules_with_vars(css, &vars);
-        assert_eq!(rules[0].font_family, "H̷e̶l̵l̴o̷");
+        let rules = parse_font_style_rules_with_vars(css, &vars);
+        assert_eq!(rules[0].font_family.as_deref(), Some("H̷e̶l̵l̴o̷"));
     }
 }
