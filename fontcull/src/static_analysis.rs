@@ -1917,21 +1917,31 @@ fn parse_css_custom_properties(css: &str) -> CssVariables {
     // Every declaration list, at any depth (inside @media, @layer and @supports too):
     // the text before a `}` back to the previous `{`, `}` or `;`-run start.
     let mut list_start = 0;
+    let mut declare = |declarations: &str| {
+        for declaration in split_top_level(declarations, ';') {
+            let declaration = declaration.trim();
+            if declaration.starts_with("--")
+                && let Some(colon) = declaration.find(':')
+            {
+                let name = declaration[..colon].trim();
+                let value = declaration[colon + 1..].trim();
+                // (the last definition wins; selector-scoped overrides are not tracked)
+                vars.insert(name.to_string(), value.to_string());
+            }
+        }
+    };
     scan_top_level(&css, |i, c, _| {
         match c {
-            '{' => list_start = i + 1,
-            '}' => {
-                for declaration in split_top_level(&css[list_start..i], ';') {
-                    let declaration = declaration.trim();
-                    if declaration.starts_with("--")
-                        && let Some(colon) = declaration.find(':')
-                    {
-                        let name = declaration[..colon].trim();
-                        let value = declaration[colon + 1..].trim();
-                        // (the last definition wins; selector-scoped overrides are not tracked)
-                        vars.insert(name.to_string(), value.to_string());
-                    }
+            '{' => {
+                // Declarations before a nested rule: up to the last `;` before its prelude.
+                let before = &css[list_start..i];
+                if let Some(end) = before.rfind(';') {
+                    declare(&before[..end]);
                 }
+                list_start = i + 1;
+            }
+            '}' => {
+                declare(&css[list_start..i]);
                 list_start = i + 1;
             }
             _ => {}
@@ -2525,6 +2535,15 @@ mod tests {
         assert_eq!(
             variant_chars("<body><h3 class=r>H</h3></body>", css, "F", 700, "normal"),
             "H"
+        );
+    }
+
+    #[test]
+    fn custom_properties_before_a_nested_rule() {
+        let css = ".a{--f:G;.z{color:red}}body{font-family:var(--f)}";
+        assert_eq!(
+            variant_chars("<body><p>P</p></body>", css, "G", 400, "normal"),
+            "P"
         );
     }
 
