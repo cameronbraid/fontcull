@@ -63,13 +63,17 @@ pub fn analyze_fonts(html: &str, css: &str) -> FontAnalysis {
 /// - A map of (family, weight, style) -> set of characters per variant
 ///
 /// Each element's font is resolved with a simplified CSS cascade: user-agent
-/// defaults, then author declarations ordered by `!important`, specificity and
-/// source order, with inheritance and the CSS-wide keywords. Characters from
-/// `::before`/`::after` `content` strings are included. Rules that apply only
-/// under some condition (inside `@media`, `@supports` or `@container`, or with
-/// `:hover`/`:focus`-style state pseudo-classes) are analysed both ways and
-/// their characters counted in both variants, so text that changes font with
-/// the viewport or interaction stays covered.
+/// defaults, then author declarations ordered by `!important`, cascade layer,
+/// specificity and source order, with inheritance and the CSS-wide keywords.
+/// Characters from `::before`/`::after` `content` strings are included.
+///
+/// Rules that apply only under some condition (inside `@media`, `@supports`,
+/// `@container` or `@scope`, or with `:hover`/`:focus`-style state
+/// pseudo-classes) may or may not apply, independently of each other. An
+/// element therefore has a set of possible fonts: the one the unconditional
+/// rules give, plus each value a conditional rule could make win. Children
+/// inherit from every possible parent font, and text counts for all of them, so
+/// text whose font changes with the viewport or interaction stays covered.
 pub fn collect_chars_per_font(
     html: &str,
     css: &str,
@@ -83,66 +87,45 @@ pub fn collect_chars_per_font(
     let css_vars = parse_css_custom_properties(css);
 
     // Parse font style rules with variable resolution
-    let font_rules = parse_font_style_rules_with_vars(css, &css_vars);
-    let has_conditional = font_rules.iter().any(|rule| rule.conditional);
+    let parsed = parse_css_rules(css, &css_vars);
+    let (element_rules, pseudo_rules): (Vec<&FontStyleRule>, Vec<&FontStyleRule>) =
+        parsed.rules.iter().partition(|rule| rule.pseudo.is_none());
+    // Characters `open-quote`/`close-quote` can generate: the defaults and any `quotes`.
+    let quote_chars = format!("{DEFAULT_QUOTES}{}", parsed.quote_chars);
 
     let mut per_family: HashMap<String, HashSet<char>> = HashMap::new();
     let mut per_variant: HashMap<FontVariantKey, HashSet<char>> = HashMap::new();
-
-    let passes: &[bool] = if has_conditional {
-        &[false, true]
-    } else {
-        &[false]
-    };
-    for &include_conditional in passes {
-        let rules: Vec<&FontStyleRule> = font_rules
-            .iter()
-            .filter(|rule| include_conditional || !rule.conditional)
-            .collect();
-        collect_pass(&document, &rules, &mut per_family, &mut per_variant);
-    }
-
-    (per_family, per_variant)
-}
-
-fn collect_pass(
-    document: &Html,
-    rules: &[&FontStyleRule],
-    per_family: &mut HashMap<String, HashSet<char>>,
-    per_variant: &mut HashMap<FontVariantKey, HashSet<char>>,
-) {
-    let (element_rules, pseudo_rules): (Vec<&FontStyleRule>, Vec<&FontStyleRule>) = rules
-        .iter()
-        .copied()
-        .partition(|rule| rule.pseudo.is_none());
-
-    let mut add = |style: &ResolvedFontStyle, text: &str| {
-        let family_chars = per_family.entry(style.font_family.clone()).or_default();
-        family_chars.extend(text.chars());
-        let key = FontVariantKey {
-            family: style.font_family.clone(),
-            weight: style.font_weight,
-            style: style.font_style.clone(),
-        };
-        per_variant.entry(key).or_default().extend(text.chars());
+    let mut add = |styles: &[ResolvedFontStyle], text: &str| {
+        for style in styles {
+            let family_chars = per_family.entry(style.font_family.clone()).or_default();
+            family_chars.extend(text.chars());
+            let key = FontVariantKey {
+                family: style.font_family.clone(),
+                weight: style.font_weight,
+                style: style.font_style.clone(),
+            };
+            per_variant.entry(key).or_default().extend(text.chars());
+        }
     };
 
     // Elements are visited in document order, so a parent is always resolved
     // before its children.
-    let mut resolved: HashMap<_, ResolvedFontStyle> = HashMap::new();
+    let root = vec![ResolvedFontStyle::default()];
+    let mut resolved: HashMap<_, Vec<ResolvedFontStyle>> = HashMap::new();
     let all_elements = Selector::parse("*").unwrap();
     for element in document.select(&all_elements) {
-        let parent = element
+        let parents = element
             .ancestors()
             .find_map(scraper::ElementRef::wrap)
             .and_then(|parent| resolved.get(&parent.id()))
-            .cloned()
-            .unwrap_or_default();
-        let matching = element_rules
+            .unwrap_or(&root);
+        let matching: Vec<&FontStyleRule> = element_rules
             .iter()
             .copied()
-            .filter(|rule| rule.selector_matches(&element));
-        let style = cascade(&parent, Some(element.value().name()), matching);
+            .filter(|rule| rule.selector_matches(&element))
+            .collect();
+        let tag = element.value().name();
+        let styles = cascade(parents, Some(tag), &matching);
 
         // Get all direct text nodes (not from children)
         let text: String = element
@@ -150,12 +133,7 @@ fn collect_pass(
             .filter_map(|child| child.value().as_text().map(|t| t.to_string()))
             .collect();
         if !text.trim().is_empty() {
-            add(&style, &text);
-        }
-
-        if element.value().name() == "q" {
-            // The user-agent stylesheet quotes `<q>` with open-quote/close-quote.
-            add(&style, DEFAULT_QUOTES);
+            add(&styles, &text);
         }
 
         for pseudo in [PseudoElement::Before, PseudoElement::After] {
@@ -166,22 +144,38 @@ fn collect_pass(
                 .collect();
             // Conservatively union every matching content value instead of
             // resolving which one wins.
-            let content: String = matching
+            let mut content: String = matching
                 .iter()
-                .filter_map(|rule| rule.content.as_deref())
+                .filter_map(|rule| rule.content.as_ref())
+                .map(|content| {
+                    if content.quotes {
+                        format!("{}{quote_chars}", content.text)
+                    } else {
+                        content.text.clone()
+                    }
+                })
                 .collect();
+            if tag == "q" {
+                // The user-agent stylesheet quotes `<q>` with open-quote/close-quote.
+                content.push_str(&quote_chars);
+            }
             if !content.trim().is_empty() {
-                let pseudo_style = cascade(&style, None, matching.iter().copied());
-                add(&pseudo_style, &content);
+                add(&cascade(&styles, None, &matching), &content);
             }
         }
 
-        resolved.insert(element.id(), style);
+        resolved.insert(element.id(), styles);
     }
+
+    (per_family, per_variant)
 }
 
 /// Characters generated by `open-quote` and `close-quote` with the default `quotes`.
 const DEFAULT_QUOTES: &str = "\u{201C}\u{201D}\u{2018}\u{2019}";
+
+/// At most this many possible fonts are tracked per element; conditional rules
+/// rarely produce more than a handful.
+const MAX_POSSIBLE_STYLES: usize = 64;
 
 /// Resolved font styling for an element.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,8 +208,15 @@ enum FontWeightValue {
     Absolute(u16),
     Bolder,
     Lighter,
-    Inherit,
-    Initial,
+    Keyword(CssWideKeyword),
+}
+
+/// Generated text of a `content` value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneratedContent {
+    text: String,
+    /// Uses `open-quote`/`close-quote`.
+    quotes: bool,
 }
 
 /// A CSS rule (one complex selector) that sets font properties or generated content.
@@ -230,14 +231,18 @@ struct FontStyleRule {
     family_important: bool,
     weight_important: bool,
     style_important: bool,
-    /// Characters of the `content` strings, for `::before`/`::after` rules.
-    content: Option<String>,
+    /// Generated text, for `::before`/`::after` rules.
+    content: Option<GeneratedContent>,
     pseudo: Option<PseudoElement>,
-    /// Inside `@media`/`@supports`/`@container`, or matching only in an interaction state.
+    /// Inside `@media`/`@supports`/`@container`/`@scope`, or matching only in an
+    /// interaction state: the rule may or may not apply.
     conditional: bool,
+    /// Inside `@layer`: unlayered normal declarations beat it, layered `!important` ones
+    /// beat unlayered `!important` ones.
+    layered: bool,
     specificity: (u32, u32, u32),
     order: usize,
-    /// The selector parsed for matching (state pseudo-classes removed).
+    /// The selector parsed for matching (top-level state pseudo-classes removed).
     parsed: Option<Selector>,
 }
 
@@ -247,84 +252,134 @@ impl FontStyleRule {
             .as_ref()
             .is_some_and(|selector| selector.matches(element))
     }
+
+    /// Cascade order of one of this rule's declarations: importance, layer, specificity,
+    /// source order.
+    fn priority(&self, important: bool) -> Priority {
+        // Layers reverse for important declarations.
+        let layer = if important {
+            self.layered
+        } else {
+            !self.layered
+        };
+        (important, layer, self.specificity, self.order)
+    }
 }
 
-/// Resolve one element's (or pseudo-element's) font from its parent's computed style,
-/// its user-agent defaults and the author rules that match it.
-fn cascade<'a>(
-    parent: &ResolvedFontStyle,
-    tag: Option<&str>,
-    rules: impl Iterator<Item = &'a FontStyleRule>,
-) -> ResolvedFontStyle {
+type Priority = (bool, bool, (u32, u32, u32), usize);
+
+/// The user-agent origin's font for an element of `tag`, inheriting `parent`.
+fn user_agent_style(parent: &ResolvedFontStyle, tag: Option<&str>) -> ResolvedFontStyle {
     // font-family, font-weight and font-style are inherited properties.
     let mut style = parent.clone();
-    if let Some(tag) = tag {
-        match tag {
-            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th" => style.font_weight = 700,
-            "b" | "strong" => style.font_weight = bolder(parent.font_weight),
-            "i" | "em" | "cite" | "dfn" | "var" | "address" => {
-                style.font_style = "italic".to_string()
-            }
-            "button" | "input" | "select" | "textarea" => {
-                // Form controls don't inherit the page font unless an author rule says so.
-                style.font_family = "system-ui".to_string();
-                style.font_weight = 400;
-                style.font_style = "normal".to_string();
-            }
-            _ => {}
+    match tag {
+        Some("h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th") => style.font_weight = 700,
+        Some("b" | "strong") => style.font_weight = bolder(parent.font_weight),
+        Some("i" | "em" | "cite" | "dfn" | "var" | "address") => {
+            style.font_style = "italic".to_string()
         }
-    }
-
-    type Priority = (bool, (u32, u32, u32), usize);
-    let mut family: Option<(Priority, &str)> = None;
-    let mut weight: Option<(Priority, FontWeightValue)> = None;
-    let mut font_style: Option<(Priority, &str)> = None;
-    for rule in rules {
-        let priority = |important: bool| (important, rule.specificity, rule.order);
-        if let Some(value) = rule.font_family.as_deref() {
-            let p = priority(rule.family_important);
-            if family.is_none_or(|(best, _)| p > best) {
-                family = Some((p, value));
-            }
+        Some("button" | "input" | "select" | "textarea") => {
+            // Form controls don't inherit the page font unless an author rule says so.
+            style.font_family = "system-ui".to_string();
+            style.font_weight = 400;
+            style.font_style = "normal".to_string();
         }
-        if let Some(value) = rule.font_weight {
-            let p = priority(rule.weight_important);
-            if weight.is_none_or(|(best, _)| p > best) {
-                weight = Some((p, value));
-            }
-        }
-        if let Some(value) = rule.font_style.as_deref() {
-            let p = priority(rule.style_important);
-            if font_style.is_none_or(|(best, _)| p > best) {
-                font_style = Some((p, value));
-            }
-        }
-    }
-
-    if let Some((_, value)) = family {
-        match css_wide_keyword(value) {
-            Some(CssWideKeyword::Inherit) => style.font_family = parent.font_family.clone(),
-            Some(CssWideKeyword::Initial) => style.font_family = "serif".to_string(),
-            None => style.font_family = value.to_string(),
-        }
-    }
-    if let Some((_, value)) = weight {
-        style.font_weight = match value {
-            FontWeightValue::Absolute(weight) => weight,
-            FontWeightValue::Bolder => bolder(parent.font_weight),
-            FontWeightValue::Lighter => lighter(parent.font_weight),
-            FontWeightValue::Inherit => parent.font_weight,
-            FontWeightValue::Initial => 400,
-        };
-    }
-    if let Some((_, value)) = font_style {
-        match css_wide_keyword(value) {
-            Some(CssWideKeyword::Inherit) => style.font_style = parent.font_style.clone(),
-            Some(CssWideKeyword::Initial) => style.font_style = "normal".to_string(),
-            None => style.font_style = value.to_string(),
-        }
+        _ => {}
     }
     style
+}
+
+/// The declarations of one property that can win: the highest-priority unconditional
+/// one (if any), and every conditional one that would beat it.
+fn possible_winners<'a, T: Copy>(
+    rules: &[&'a FontStyleRule],
+    value: impl Fn(&'a FontStyleRule) -> Option<(T, bool)>,
+) -> Vec<Option<T>> {
+    let mut base: Option<(Priority, T)> = None;
+    for rule in rules.iter().filter(|rule| !rule.conditional) {
+        if let Some((v, important)) = value(rule) {
+            let p = rule.priority(important);
+            if base.is_none_or(|(best, _)| p > best) {
+                base = Some((p, v));
+            }
+        }
+    }
+    let mut winners = vec![base.map(|(_, v)| v)];
+    for rule in rules.iter().filter(|rule| rule.conditional) {
+        if let Some((v, important)) = value(rule)
+            && base.is_none_or(|(best, _)| rule.priority(important) > best)
+        {
+            winners.push(Some(v));
+        }
+    }
+    winners
+}
+
+/// Resolve the possible fonts of one element (or pseudo-element) from its parent's
+/// possible fonts, its user-agent defaults and the author rules that match it.
+fn cascade(
+    parents: &[ResolvedFontStyle],
+    tag: Option<&str>,
+    rules: &[&FontStyleRule],
+) -> Vec<ResolvedFontStyle> {
+    let families = possible_winners(rules, |rule| {
+        rule.font_family
+            .as_deref()
+            .map(|family| (family, rule.family_important))
+    });
+    let weights = possible_winners(rules, |rule| {
+        rule.font_weight
+            .map(|weight| (weight, rule.weight_important))
+    });
+    let font_styles = possible_winners(rules, |rule| {
+        rule.font_style
+            .as_deref()
+            .map(|style| (style, rule.style_important))
+    });
+
+    let mut out: Vec<ResolvedFontStyle> = Vec::new();
+    for parent in parents {
+        let ua = user_agent_style(parent, tag);
+        for family in &families {
+            let font_family = match family.map(|f| (f, css_wide_keyword(f))) {
+                None => ua.font_family.clone(),
+                Some((_, Some(CssWideKeyword::Inherit))) => parent.font_family.clone(),
+                Some((_, Some(CssWideKeyword::Revert))) => ua.font_family.clone(),
+                Some((_, Some(CssWideKeyword::Initial))) => "serif".to_string(),
+                Some((family, None)) => family.to_string(),
+            };
+            for weight in &weights {
+                let font_weight = match weight {
+                    None | Some(FontWeightValue::Keyword(CssWideKeyword::Revert)) => ua.font_weight,
+                    Some(FontWeightValue::Absolute(weight)) => *weight,
+                    Some(FontWeightValue::Bolder) => bolder(parent.font_weight),
+                    Some(FontWeightValue::Lighter) => lighter(parent.font_weight),
+                    Some(FontWeightValue::Keyword(CssWideKeyword::Inherit)) => parent.font_weight,
+                    Some(FontWeightValue::Keyword(CssWideKeyword::Initial)) => 400,
+                };
+                for style in &font_styles {
+                    let font_style = match style.map(|s| (s, css_wide_keyword(s))) {
+                        None | Some((_, Some(CssWideKeyword::Revert))) => ua.font_style.clone(),
+                        Some((_, Some(CssWideKeyword::Inherit))) => parent.font_style.clone(),
+                        Some((_, Some(CssWideKeyword::Initial))) => "normal".to_string(),
+                        Some((style, None)) => style.to_string(),
+                    };
+                    let resolved = ResolvedFontStyle {
+                        font_family: font_family.clone(),
+                        font_weight,
+                        font_style,
+                    };
+                    if !out.contains(&resolved) {
+                        if out.len() >= MAX_POSSIBLE_STYLES {
+                            return out;
+                        }
+                        out.push(resolved);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// `bolder` relative to the inherited weight (CSS Fonts 4, relative weights).
@@ -349,15 +404,18 @@ fn lighter(parent: u16) -> u16 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CssWideKeyword {
-    /// `inherit`, and `unset`/`revert`/`revert-layer`, which inherit for these inherited
-    /// properties.
+    /// `inherit`, and `unset`, which inherits for these inherited properties.
     Inherit,
+    /// `revert` and `revert-layer`: the user-agent origin's value (layers are not
+    /// distinguished).
+    Revert,
     Initial,
 }
 
 fn css_wide_keyword(value: &str) -> Option<CssWideKeyword> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "inherit" | "unset" | "revert" | "revert-layer" => Some(CssWideKeyword::Inherit),
+        "inherit" | "unset" => Some(CssWideKeyword::Inherit),
+        "revert" | "revert-layer" => Some(CssWideKeyword::Revert),
         "initial" => Some(CssWideKeyword::Initial),
         _ => None,
     }
@@ -366,10 +424,8 @@ fn css_wide_keyword(value: &str) -> Option<CssWideKeyword> {
 /// Parse a CSS font-weight value.
 fn parse_font_weight(value: &str) -> Option<FontWeightValue> {
     let value = value.trim().to_ascii_lowercase();
-    match css_wide_keyword(&value) {
-        Some(CssWideKeyword::Inherit) => return Some(FontWeightValue::Inherit),
-        Some(CssWideKeyword::Initial) => return Some(FontWeightValue::Initial),
-        None => {}
+    if let Some(keyword) = css_wide_keyword(&value) {
+        return Some(FontWeightValue::Keyword(keyword));
     }
     match value.as_str() {
         "normal" => Some(FontWeightValue::Absolute(400)),
@@ -399,6 +455,25 @@ fn parse_font_style(value: &str) -> Option<String> {
     }
 }
 
+/// Whitespace-separated component values at the top level, keeping functions such as
+/// `calc(1rem + 2px)` and quoted strings whole, with `/` as a token of its own.
+fn component_values(value: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut rest = value.trim();
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix('/') {
+            tokens.push("/");
+            rest = after.trim_start();
+            continue;
+        }
+        let end =
+            find_top_level(rest, &[' ', '\t', '\n', '\r', '\u{c}', '/']).unwrap_or(rest.len());
+        tokens.push(&rest[..end]);
+        rest = rest[end..].trim_start();
+    }
+    tokens
+}
+
 /// The font properties set by a `font` shorthand: (family, weight, style).
 fn parse_font_shorthand(
     value: &str,
@@ -406,38 +481,26 @@ fn parse_font_shorthand(
 ) -> Option<(String, FontWeightValue, String)> {
     let value = resolve_css_var(value.trim(), css_vars);
     if let Some(keyword) = css_wide_keyword(&value) {
-        let (weight, style) = match keyword {
-            CssWideKeyword::Inherit => (FontWeightValue::Inherit, "inherit"),
-            CssWideKeyword::Initial => (FontWeightValue::Initial, "initial"),
-        };
-        return Some((value.trim().to_string(), weight, style.to_string()));
+        return Some((
+            value.trim().to_string(),
+            FontWeightValue::Keyword(keyword),
+            value.trim().to_string(),
+        ));
     }
     // [style || variant || weight || stretch]? size [/ line-height]? family
     let mut weight = FontWeightValue::Absolute(400);
     let mut style = "normal".to_string();
-    let mut rest = value.as_str();
-    loop {
-        rest = rest.trim_start();
-        let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let token = &rest[..token_end];
-        if token.is_empty() {
-            return None; // no size or family: a system font keyword or invalid
-        }
+    let tokens = component_values(&value);
+    for (index, token) in tokens.iter().enumerate() {
         let lower = token.to_ascii_lowercase();
         if is_font_size(&lower) {
-            let mut after = rest[token_end..].trim_start();
-            if let Some(line_height) = after.strip_prefix('/') {
-                let line_height = line_height.trim_start();
-                let end = line_height
-                    .find(char::is_whitespace)
-                    .unwrap_or(line_height.len());
-                after = &line_height[end..];
+            let mut family_start = index + 1;
+            if tokens.get(family_start) == Some(&"/") {
+                family_start += 2; // skip the line height
             }
-            let family = parse_font_family_value_with_vars(after, css_vars);
-            if family.is_empty() {
-                return None;
-            }
-            return Some((family, weight, style));
+            let family = tokens.get(family_start..)?.join(" ");
+            let family = parse_font_family_value_with_vars(&family, css_vars);
+            return (!family.is_empty()).then_some((family, weight, style));
         }
         if let Some(parsed) = parse_font_style(&lower) {
             style = parsed;
@@ -445,14 +508,13 @@ fn parse_font_shorthand(
             weight = parsed;
         }
         // font-variant and font-stretch keywords are ignored
-        rest = &rest[token_end..];
     }
+    None // no size: a system font keyword or invalid
 }
 
 fn is_font_size(token: &str) -> bool {
-    let size = token.split('/').next().unwrap_or(token);
     matches!(
-        size,
+        token,
         "xx-small"
             | "x-small"
             | "small"
@@ -463,156 +525,193 @@ fn is_font_size(token: &str) -> bool {
             | "xxx-large"
             | "smaller"
             | "larger"
-    ) || size.starts_with(|c: char| c.is_ascii_digit() || c == '.')
-        && !size.chars().all(|c| c.is_ascii_digit())
-        || size.starts_with("calc(")
-        || size.starts_with("clamp(")
-        || size.starts_with("min(")
-        || size.starts_with("max(")
+    ) || token.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+        && !token.chars().all(|c| c.is_ascii_digit())
+        || ["calc(", "clamp(", "min(", "max(", "var("]
+            .iter()
+            .any(|function| token.starts_with(function))
 }
 
 /// Parse a `content` value into the characters it generates. Quoted strings (with CSS
-/// escapes) and quote keywords produce text; `attr()`, counters and images are ignored.
-fn parse_content(value: &str) -> Option<String> {
+/// escapes) produce text and the quote keywords are flagged; `attr()`, counters and
+/// images are ignored.
+fn parse_content(value: &str) -> Option<GeneratedContent> {
     let mut text = String::new();
+    let mut quotes = false;
     let mut chars = value.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '"' | '\'' => {
-                let quote = c;
-                while let Some(c) = chars.next() {
-                    if c == quote {
-                        break;
-                    }
-                    if c == '\\' {
-                        let mut hex = String::new();
-                        while hex.len() < 6 && chars.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
-                            hex.push(chars.next().unwrap_or_default());
-                        }
-                        if hex.is_empty() {
-                            if let Some(escaped) = chars.next()
-                                && escaped != '\n'
-                            {
-                                text.push(escaped);
-                            }
-                        } else {
-                            if chars.peek().is_some_and(|c| c.is_whitespace()) {
-                                chars.next();
-                            }
-                            if let Some(decoded) =
-                                u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
-                            {
-                                text.push(decoded);
-                            }
-                        }
-                    } else {
-                        text.push(c);
-                    }
-                }
-            }
+            '"' | '\'' => text.push_str(&read_css_string(c, &mut chars)),
             _ if c.is_alphabetic() => {
                 let mut word = String::from(c);
-                while chars
-                    .peek()
-                    .is_some_and(|c| c.is_alphanumeric() || *c == '-')
-                {
-                    word.push(chars.next().unwrap_or_default());
+                while let Some(next) = chars.next_if(|c| c.is_alphanumeric() || *c == '-') {
+                    word.push(next);
                 }
-                if matches!(word.as_str(), "open-quote" | "close-quote") {
-                    text.push_str(DEFAULT_QUOTES);
+                if word.eq_ignore_ascii_case("open-quote")
+                    || word.eq_ignore_ascii_case("close-quote")
+                {
+                    quotes = true;
                 }
             }
             _ => {}
         }
     }
-    (!text.is_empty()).then_some(text)
+    (!text.is_empty() || quotes).then_some(GeneratedContent { text, quotes })
+}
+
+/// Read a CSS string's value after its opening `quote`, decoding escapes.
+fn read_css_string(quote: char, chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
+    let mut text = String::new();
+    while let Some(c) = chars.next() {
+        if c == quote {
+            break;
+        }
+        if c != '\\' {
+            text.push(c);
+            continue;
+        }
+        let mut hex = String::new();
+        while hex.len() < 6 {
+            match chars.next_if(char::is_ascii_hexdigit) {
+                Some(digit) => hex.push(digit),
+                None => break,
+            }
+        }
+        if hex.is_empty() {
+            if let Some(escaped) = chars.next()
+                && escaped != '\n'
+            {
+                text.push(escaped);
+            }
+        } else {
+            chars.next_if(|c| c.is_whitespace());
+            if let Some(decoded) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                text.push(decoded);
+            }
+        }
+    }
+    text
+}
+
+/// Rules and other values read from a stylesheet.
+struct ParsedCss {
+    rules: Vec<FontStyleRule>,
+    /// Characters of every `quotes` declaration.
+    quote_chars: String,
 }
 
 /// Parse CSS and extract rules that set font-family, font-weight, font-style or the
 /// `content` of `::before`/`::after`, with CSS variable resolution.
-///
-/// Selector lists become one rule per selector. Rules inside `@media`, `@supports` and
-/// `@container` are marked conditional; other at-rules (such as `@font-face` and
-/// `@keyframes`) are skipped.
 fn parse_font_style_rules_with_vars(css: &str, css_vars: &CssVariables) -> Vec<FontStyleRule> {
-    let mut rules = Vec::new();
-    let css = strip_css_comments(css);
-    parse_rule_list(&css, css_vars, false, &mut rules);
-    rules
+    parse_css_rules(css, css_vars).rules
 }
 
+/// Selector lists become one rule per selector. Rules inside `@media`, `@supports`,
+/// `@container` and `@scope` are conditional and rules inside `@layer` layered; other
+/// at-rules (such as `@font-face` and `@keyframes`) are skipped.
+fn parse_css_rules(css: &str, css_vars: &CssVariables) -> ParsedCss {
+    let mut parsed = ParsedCss {
+        rules: Vec::new(),
+        quote_chars: String::new(),
+    };
+    let css = strip_css_comments(css);
+    parse_rule_list(&css, css_vars, Context::default(), &mut parsed);
+    parsed
+}
+
+/// Remove `/* … */` comments outside strings.
 fn strip_css_comments(css: &str) -> String {
     let mut out = String::with_capacity(css.len());
-    let mut rest = css;
-    while let Some(start) = rest.find("/*") {
-        out.push_str(&rest[..start]);
-        rest = match rest[start + 2..].find("*/") {
-            Some(end) => &rest[start + 2 + end + 2..],
-            None => "",
-        };
+    let mut chars = css.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if c == '\\' {
+                    if let Some(escaped) = chars.next() {
+                        out.push(escaped);
+                    }
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None if c == '/' && chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut previous = '\0';
+                for c in chars.by_ref() {
+                    if previous == '*' && c == '/' {
+                        break;
+                    }
+                    previous = c;
+                }
+                out.push(' ');
+            }
+            None => {
+                if c == '"' || c == '\'' {
+                    quote = Some(c);
+                } else if c == '\\' {
+                    out.push(c);
+                    if let Some(escaped) = chars.next() {
+                        out.push(escaped);
+                    }
+                    continue;
+                }
+                out.push(c);
+            }
+        }
     }
-    out.push_str(rest);
     out
 }
 
-/// Byte index of the first `target` at nesting depth zero outside strings.
-fn find_top_level(s: &str, targets: &[char]) -> Option<usize> {
+/// Visit `s` outside strings and escapes, with the bracket depth of each character;
+/// stop when `visit` returns `true`, returning that byte index.
+fn scan_top_level(s: &str, mut visit: impl FnMut(usize, char, i32) -> bool) -> Option<usize> {
     let mut depth = 0i32;
     let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for (i, c) in s.char_indices() {
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c == '\\' {
+            chars.next(); // the escaped character
+            continue;
+        }
         if let Some(q) = quote {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == q {
+            if c == q {
                 quote = None;
             }
             continue;
         }
         match c {
             '"' | '\'' => quote = Some(c),
-            '\\' => escaped = true,
-            _ if depth == 0 && targets.contains(&c) => return Some(i),
-            '(' | '[' => depth += 1,
             ')' | ']' => depth -= 1,
             _ => {}
         }
+        if visit(i, c, depth) {
+            return Some(i);
+        }
+        if matches!(c, '(' | '[') {
+            depth += 1;
+        }
     }
     None
+}
+
+/// Byte index of the first `target` at nesting depth zero outside strings and escapes.
+fn find_top_level(s: &str, targets: &[char]) -> Option<usize> {
+    scan_top_level(s, |_, c, depth| depth == 0 && targets.contains(&c))
 }
 
 /// Byte index of the `}` that closes a block whose `{` precedes `s`.
 fn find_block_end(s: &str) -> Option<usize> {
-    let mut depth = 1i32;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for (i, c) in s.char_indices() {
-        if let Some(q) = quote {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == q {
-                quote = None;
-            }
-            continue;
-        }
+    let mut braces = 1i32;
+    scan_top_level(s, |_, c, _| {
         match c {
-            '"' | '\'' => quote = Some(c),
-            '\\' => escaped = true,
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
+            '{' => braces += 1,
+            '}' => braces -= 1,
             _ => {}
         }
-    }
-    None
+        braces == 0
+    })
 }
 
 fn split_top_level(s: &str, separator: char) -> Vec<&str> {
@@ -626,12 +725,14 @@ fn split_top_level(s: &str, separator: char) -> Vec<&str> {
     parts
 }
 
-fn parse_rule_list(
-    css: &str,
-    css_vars: &CssVariables,
+/// The at-rule context of a rule list.
+#[derive(Debug, Clone, Copy, Default)]
+struct Context {
     conditional: bool,
-    rules: &mut Vec<FontStyleRule>,
-) {
+    layered: bool,
+}
+
+fn parse_rule_list(css: &str, css_vars: &CssVariables, context: Context, parsed: &mut ParsedCss) {
     let mut rest = css;
     loop {
         rest = rest.trim_start();
@@ -642,7 +743,7 @@ fn parse_rule_list(
             return;
         };
         if !rest[open..].starts_with('{') {
-            // a statement at-rule (`@import …;`), or a stray `;`/`}`
+            // a statement at-rule (`@import …;`, `@layer a, b;`), or a stray `;`/`}`
             rest = &rest[open + 1..];
             continue;
         }
@@ -660,16 +761,34 @@ fn parse_rule_list(
                 .next()
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            match name.as_str() {
-                "media" | "supports" | "container" | "document" | "-moz-document" => {
-                    parse_rule_list(block, css_vars, true, rules)
+            let inner = match name.as_str() {
+                "media" | "supports" | "container" | "scope" | "document" | "-moz-document" => {
+                    Context {
+                        conditional: true,
+                        ..context
+                    }
                 }
-                "layer" | "scope" => parse_rule_list(block, css_vars, conditional, rules),
-                _ => {} // @font-face, @keyframes, @page, @property, …
-            }
+                "layer" => Context {
+                    layered: true,
+                    ..context
+                },
+                _ => continue, // @font-face, @keyframes, @page, @property, …
+            };
+            parse_rule_list(block, css_vars, inner, parsed);
             continue;
         }
-        push_style_rules(prelude, block, css_vars, conditional, rules);
+        push_style_rules(prelude, block, css_vars, context, parsed);
+    }
+}
+
+/// A declaration value with its importance; a later declaration of the same property
+/// replaces it unless it is `!important` and the later one isn't.
+fn declare<T>(slot: &mut Option<(T, bool)>, value: T, important: bool) {
+    if !slot
+        .as_ref()
+        .is_some_and(|(_, was_important)| *was_important && !important)
+    {
+        *slot = Some((value, important));
     }
 }
 
@@ -677,16 +796,13 @@ fn push_style_rules(
     prelude: &str,
     block: &str,
     css_vars: &CssVariables,
-    conditional: bool,
-    rules: &mut Vec<FontStyleRule>,
+    context: Context,
+    parsed: &mut ParsedCss,
 ) {
-    let mut font_family = None;
-    let mut font_weight = None;
-    let mut font_style = None;
-    let mut family_important = false;
-    let mut weight_important = false;
-    let mut style_important = false;
-    let mut content = None;
+    let mut font_family: Option<(String, bool)> = None;
+    let mut font_weight: Option<(FontWeightValue, bool)> = None;
+    let mut font_style: Option<(String, bool)> = None;
+    let mut content: Option<GeneratedContent> = None;
 
     // (nested rules in the block are ignored: their declarations come after them)
     let declarations = match find_top_level(block, &['{']) {
@@ -694,46 +810,47 @@ fn push_style_rules(
         None => block,
     };
     for declaration in split_top_level(declarations, ';') {
-        let Some(colon) = declaration.find(':') else {
+        let Some(colon) = find_top_level(declaration, &[':']) else {
             continue;
         };
         let name = declaration[..colon].trim().to_ascii_lowercase();
         let mut value = declaration[colon + 1..].trim();
         let mut important = false;
-        if let Some(i) = value.to_ascii_lowercase().rfind("!important")
-            && value[i + "!important".len()..].trim().is_empty()
+        if let Some(bang) = find_top_level(value, &['!'])
+            && value[bang + 1..].trim().eq_ignore_ascii_case("important")
         {
-            value = value[..i].trim_end();
+            value = value[..bang].trim_end();
             important = true;
         }
         match name.as_str() {
-            "font-family" => {
-                font_family = Some(parse_font_family_value_with_vars(value, css_vars));
-                family_important = important;
-            }
+            "font-family" => declare(
+                &mut font_family,
+                parse_font_family_value_with_vars(value, css_vars),
+                important,
+            ),
             "font-weight" => {
                 if let Some(weight) = parse_font_weight(&resolve_css_var(value, css_vars)) {
-                    font_weight = Some(weight);
-                    weight_important = important;
+                    declare(&mut font_weight, weight, important);
                 }
             }
             "font-style" => {
                 if let Some(style) = parse_font_style(&resolve_css_var(value, css_vars)) {
-                    font_style = Some(style);
-                    style_important = important;
+                    declare(&mut font_style, style, important);
                 }
             }
             "font" => {
                 if let Some((family, weight, style)) = parse_font_shorthand(value, css_vars) {
-                    font_family = Some(family);
-                    font_weight = Some(weight);
-                    font_style = Some(style);
-                    family_important = important;
-                    weight_important = important;
-                    style_important = important;
+                    declare(&mut font_family, family, important);
+                    declare(&mut font_weight, weight, important);
+                    declare(&mut font_style, style, important);
                 }
             }
             "content" => content = parse_content(&resolve_css_var(value, css_vars)),
+            "quotes" => {
+                if let Some(quotes) = parse_content(&resolve_css_var(value, css_vars)) {
+                    parsed.quote_chars.push_str(&quotes.text);
+                }
+            }
             _ => {}
         }
     }
@@ -752,30 +869,30 @@ fn push_style_rules(
         let Some(base) = base else {
             continue; // another pseudo-element, such as ::placeholder or ::marker
         };
-        let base = base.as_str();
         if pseudo.is_none() && !sets_font {
             continue; // `content` only applies to pseudo-elements
         }
-        let (matchable, state_dependent) = strip_state_pseudo_classes(base);
-        let order = rules.len();
-        rules.push(FontStyleRule {
-            selector: base.to_string(),
-            font_family: font_family.clone(),
-            font_weight,
-            font_style: font_style.clone(),
-            family_important,
-            weight_important,
-            style_important,
+        let (matchable, state_dependent) = strip_state_pseudo_classes(&base);
+        let order = parsed.rules.len();
+        parsed.rules.push(FontStyleRule {
+            specificity: specificity(&base),
+            parsed: Selector::parse(&matchable).ok(),
+            selector: base,
+            font_family: font_family.as_ref().map(|(v, _)| v.clone()),
+            font_weight: font_weight.map(|(v, _)| v),
+            font_style: font_style.as_ref().map(|(v, _)| v.clone()),
+            family_important: font_family.as_ref().is_some_and(|(_, i)| *i),
+            weight_important: font_weight.is_some_and(|(_, i)| i),
+            style_important: font_style.as_ref().is_some_and(|(_, i)| *i),
             content: if pseudo.is_some() {
                 content.clone()
             } else {
                 None
             },
             pseudo,
-            conditional: conditional || state_dependent,
-            specificity: specificity(base),
+            conditional: context.conditional || state_dependent,
+            layered: context.layered,
             order,
-            parsed: Selector::parse(&matchable).ok(),
         });
     }
 }
@@ -783,27 +900,47 @@ fn push_style_rules(
 /// Split a trailing `::before`/`::after` (or the legacy single-colon form) off a
 /// selector. The base is `None` when the selector targets another pseudo-element.
 fn split_pseudo_element(selector: &str) -> (Option<String>, Option<PseudoElement>) {
-    let lower = selector.to_ascii_lowercase();
     for (suffix, pseudo) in [
         ("::before", PseudoElement::Before),
         ("::after", PseudoElement::After),
         (":before", PseudoElement::Before),
         (":after", PseudoElement::After),
     ] {
-        if lower.ends_with(suffix) {
-            let base = &selector[..selector.len() - suffix.len()];
-            let base = if base.trim().is_empty() {
-                "*".to_string()
-            } else if base.ends_with(|c: char| c.is_whitespace() || matches!(c, '>' | '+' | '~')) {
-                // `ul ::before` and `ul > ::before` apply to any matching descendant
-                format!("{base}*")
-            } else {
-                base.to_string()
-            };
-            return (Some(base), Some(pseudo));
+        let Some(start) = selector.len().checked_sub(suffix.len()) else {
+            continue;
+        };
+        if !selector
+            .get(start..)
+            .is_some_and(|end| end.eq_ignore_ascii_case(suffix))
+        {
+            continue;
         }
+        let base = &selector[..start];
+        if base.ends_with('\\') {
+            continue; // an escaped colon in a name, such as `.a\:before`
+        }
+        let base = if base.trim().is_empty() {
+            "*".to_string()
+        } else if base.ends_with(|c: char| c.is_whitespace() || matches!(c, '>' | '+' | '~')) {
+            // `ul ::before` and `ul > ::before` apply to any matching descendant
+            format!("{base}*")
+        } else {
+            base.to_string()
+        };
+        return (Some(base), Some(pseudo));
     }
-    if lower.contains("::") || lower.ends_with(":first-line") || lower.ends_with(":first-letter") {
+    let mut other_pseudo_element = false;
+    scan_top_level(selector, |i, c, _| {
+        let rest = &selector[i..];
+        other_pseudo_element |= c == ':'
+            && (rest.starts_with("::")
+                || [":first-line", ":first-letter"].iter().any(|legacy| {
+                    rest.get(..legacy.len())
+                        .is_some_and(|r| r.eq_ignore_ascii_case(legacy))
+                }));
+        false
+    });
+    if other_pseudo_element {
         return (None, None);
     }
     (Some(selector.to_string()), None)
@@ -820,35 +957,55 @@ const STATE_PSEUDO_CLASSES: [&str; 7] = [
     ":target",
 ];
 
-/// Remove interaction-state pseudo-classes so the rule can be matched as if the state
-/// applied. Returns the selector to match and whether anything was removed.
+/// Rewrite interaction-state pseudo-classes so the static document can be matched.
+/// Top-level ones are removed, matching as if the state applied; ones inside functional
+/// pseudo-classes such as `:not(:hover)` become the never-matching `:not(*)`, the
+/// document's resting state. Returns the selector to match and whether it depends on a
+/// state (then the rule may or may not apply).
 fn strip_state_pseudo_classes(selector: &str) -> (String, bool) {
-    let mut out = String::with_capacity(selector.len());
-    let mut removed = false;
-    let mut rest = selector;
-    'outer: while !rest.is_empty() {
-        if rest.starts_with(':') && !rest.starts_with("::") {
-            let lower = rest.to_ascii_lowercase();
-            for state in STATE_PSEUDO_CLASSES {
-                let ends_identifier = lower[state.len().min(lower.len())..]
-                    .chars()
-                    .next()
-                    .is_none_or(|c| !(c.is_alphanumeric() || c == '-' || c == '_' || c == '('));
-                if lower.starts_with(state) && ends_identifier {
-                    if out.is_empty() || out.ends_with([' ', '>', '+', '~', '(', ',']) {
-                        out.push('*');
-                    }
-                    rest = &rest[state.len()..];
-                    removed = true;
-                    continue 'outer;
-                }
+    let mut found: Vec<(usize, usize, bool)> = Vec::new(); // (start, end, nested)
+    scan_top_level(selector, |i, c, depth| {
+        if c != ':' || selector[i..].starts_with("::") || selector[..i].ends_with(':') {
+            return false;
+        }
+        let rest = &selector[i..];
+        for state in STATE_PSEUDO_CLASSES {
+            let Some(after) = rest
+                .get(..state.len())
+                .filter(|prefix| prefix.eq_ignore_ascii_case(state))
+                .map(|_| &rest[state.len()..])
+            else {
+                continue;
+            };
+            let ends_name = after
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '-' || c == '_' || c == '('));
+            if ends_name {
+                found.push((i, i + state.len(), depth > 0));
+                break;
             }
         }
-        let c = rest.chars().next().unwrap_or_default();
-        out.push(c);
-        rest = &rest[c.len_utf8()..];
+        false
+    });
+    if found.is_empty() {
+        return (selector.to_string(), false);
     }
-    (out, removed)
+    let mut out = String::with_capacity(selector.len());
+    let mut last = 0;
+    for (start, end, nested) in found {
+        out.push_str(&selector[last..start]);
+        if nested {
+            out.push_str(":not(*)");
+        } else if out.is_empty()
+            || out.ends_with(|c: char| c.is_whitespace() || matches!(c, '>' | '+' | '~'))
+        {
+            out.push('*');
+        }
+        last = end;
+    }
+    out.push_str(&selector[last..]);
+    (out, true)
 }
 
 /// Approximate CSS selector specificity as (ids, classes/attributes/pseudo-classes, types).
@@ -858,75 +1015,88 @@ fn specificity(selector: &str) -> (u32, u32, u32) {
     let mut types = 0;
     let chars: Vec<char> = selector.chars().collect();
     let mut i = 0;
-    let identifier =
-        |c: char| c.is_alphanumeric() || c == '-' || c == '_' || c == '\\' || !c.is_ascii();
+    let identifier = |c: char| c.is_alphanumeric() || c == '-' || c == '_' || !c.is_ascii();
+    // Skip an identifier from `i`, including escapes such as `\:` and `\2c `.
+    let skip_identifier = |mut i: usize| {
+        while i < chars.len() {
+            if chars[i] == '\\' {
+                i += 2;
+            } else if identifier(chars[i]) {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        i
+    };
+    // The index after the bracket matching the one at `open`, skipping strings.
+    let skip_group = |open: usize, close: char| {
+        let rest: String = chars[open + 1..].iter().collect();
+        // (the closing bracket is the first at depth -1 relative to its contents)
+        match scan_top_level(&rest, |_, c, depth| c == close && depth == -1) {
+            Some(end) => open + 1 + rest[..end].chars().count() + 1,
+            None => chars.len(),
+        }
+    };
     while i < chars.len() {
-        let c = chars[i];
-        match c {
+        match chars[i] {
             '#' => {
                 ids += 1;
-                i += 1;
-                while i < chars.len() && identifier(chars[i]) {
-                    i += 1;
-                }
+                i = skip_identifier(i + 1);
             }
             '.' => {
                 classes += 1;
-                i += 1;
-                while i < chars.len() && identifier(chars[i]) {
-                    i += 1;
-                }
+                i = skip_identifier(i + 1);
             }
             '[' => {
                 classes += 1;
-                let rest: String = chars[i..].iter().collect();
-                i += find_top_level(&rest[1..], &[']'])
-                    .map_or(rest.len(), |end| rest[..1 + end + 1].chars().count());
+                i = skip_group(i, ']');
             }
             ':' => {
                 let element = chars.get(i + 1) == Some(&':');
-                i += if element { 2 } else { 1 };
-                let start = i;
-                while i < chars.len() && identifier(chars[i]) {
-                    i += 1;
-                }
+                let start = if element { i + 2 } else { i + 1 };
+                i = skip_identifier(start);
                 let name: String = chars[start..i]
                     .iter()
                     .collect::<String>()
                     .to_ascii_lowercase();
                 let mut argument = None;
                 if chars.get(i) == Some(&'(') {
-                    let rest: String = chars[i + 1..].iter().collect();
-                    let end = find_top_level(&rest, &[')']).unwrap_or(rest.len());
-                    argument = Some(rest[..end].to_string());
-                    i += 1 + rest[..end].chars().count() + 1;
+                    let end = skip_group(i, ')');
+                    argument = Some(
+                        chars[i + 1..end.saturating_sub(1).max(i + 1)]
+                            .iter()
+                            .collect::<String>(),
+                    );
+                    i = end;
                 }
                 if element {
                     types += 1;
-                } else {
-                    match (name.as_str(), argument) {
-                        ("where", _) => {}
-                        ("is" | "not" | "has" | "matches" | "-webkit-any", Some(argument)) => {
-                            let max = split_top_level(&argument, ',')
-                                .into_iter()
-                                .map(specificity)
-                                .max()
-                                .unwrap_or_default();
-                            ids += max.0;
-                            classes += max.1;
-                            types += max.2;
-                        }
-                        ("before" | "after" | "first-line" | "first-letter", None) => types += 1,
-                        _ => classes += 1,
+                    continue;
+                }
+                match (name.as_str(), argument) {
+                    ("where", _) => {}
+                    ("is" | "not" | "has" | "matches" | "-webkit-any", Some(argument)) => {
+                        let max = split_top_level(&argument, ',')
+                            .into_iter()
+                            .map(specificity)
+                            .max()
+                            .unwrap_or_default();
+                        ids += max.0;
+                        classes += max.1;
+                        types += max.2;
                     }
+                    ("before" | "after" | "first-line" | "first-letter", None) => types += 1,
+                    _ => classes += 1,
                 }
             }
-            '*' => i += 1,
-            _ if identifier(c) => {
+            '\\' => {
                 types += 1;
-                while i < chars.len() && identifier(chars[i]) {
-                    i += 1;
-                }
+                i = skip_identifier(i);
+            }
+            c if identifier(c) => {
+                types += 1;
+                i = skip_identifier(i);
             }
             _ => i += 1,
         }
@@ -1321,6 +1491,139 @@ mod tests {
         assert_eq!(variant_chars(html, css, "Print", 400, "normal"), "C");
         assert_eq!(variant_chars(html, css, "X", 400, "normal"), "");
         assert_eq!(variant_chars(html, css, "F", 100, "normal"), "");
+    }
+
+    #[test]
+    fn independent_media_rules_each_give_a_variant() {
+        let css = "body{font-family:F}@media(max-width:600px){p{font-weight:600}}\
+                   @media(min-width:601px){p{font-weight:700}}";
+        let html = "<body><p>Q?</p></body>";
+        for weight in [400, 600, 700] {
+            assert_eq!(
+                variant_chars(html, css, "F", weight, "normal"),
+                "?Q",
+                "weight {weight}"
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_parent_fonts_are_inherited() {
+        let css = "body{font-family:F}@media(max-width:600px){.card{font-weight:600}}";
+        let html = "<body><div class=card><span>S</span></div></body>";
+        assert_eq!(variant_chars(html, css, "F", 600, "normal"), "S");
+        assert_eq!(variant_chars(html, css, "F", 400, "normal"), "S");
+    }
+
+    #[test]
+    fn negated_state_pseudo_classes_still_match() {
+        let css = "body{font-family:F}p:not(:hover){font-weight:600}[data-x=\":hover\"]{font-style:italic}";
+        let html = "<body><p>Q?</p><span data-x=\":hover\">I</span><span data-x=y>N</span></body>";
+        assert_eq!(variant_chars(html, css, "F", 600, "normal"), "?Q");
+        assert_eq!(variant_chars(html, css, "F", 400, "italic"), "I");
+        // a hovered paragraph is 400
+        assert_eq!(variant_chars(html, css, "F", 400, "normal"), "?NQ");
+    }
+
+    #[test]
+    fn important_declaration_survives_a_later_one_in_its_block() {
+        let css = "body{font-family:F}p{font-weight:600!important;font-weight:400}";
+        assert_eq!(
+            variant_chars("<body><p>Q?</p></body>", css, "F", 600, "normal"),
+            "?Q"
+        );
+    }
+
+    #[test]
+    fn unlayered_rules_beat_layered_ones() {
+        let css = "body{font-family:F}p{font-weight:600}@layer base{p{font-weight:400}}\
+                   @layer base{.i{font-weight:800!important}}.i{font-weight:300!important}";
+        let html = "<body><p>Q?</p><p class=i>I</p></body>";
+        assert_eq!(variant_chars(html, css, "F", 600, "normal"), "?Q");
+        assert_eq!(variant_chars(html, css, "F", 800, "normal"), "I");
+    }
+
+    #[test]
+    fn scoped_rules_keep_the_unscoped_font() {
+        let css = "body{font-family:F}@scope(.a){p{font-weight:600}}";
+        let html = "<body><p>Q?</p></body>";
+        assert_eq!(variant_chars(html, css, "F", 400, "normal"), "?Q");
+    }
+
+    #[test]
+    fn font_shorthand_with_spaced_line_height_and_functions() {
+        let css = "p{font:600 16px/ 1.5 Karla}h1{font:italic 700 calc(1rem + 2px) / 1.2 \"Display\", serif}";
+        let html = "<body><p>P</p><h1>H</h1></body>";
+        assert_eq!(variant_chars(html, css, "Karla", 600, "normal"), "P");
+        assert_eq!(variant_chars(html, css, "Display", 700, "italic"), "H");
+    }
+
+    #[test]
+    fn comment_openers_inside_strings_are_kept() {
+        let css = "body{font-family:F}p::before{content:\"/*\"}p{font-weight:600}";
+        let html = "<body><p>Q?</p></body>";
+        assert_eq!(variant_chars(html, css, "F", 600, "normal"), "*/?Q");
+    }
+
+    #[test]
+    fn escaped_selector_punctuation() {
+        let css = "body{font-family:F}.x\\,y{font-weight:600}.a\\:b{font-weight:700}";
+        let html = "<body><p class=\"x,y\">Q?</p><p class=\"a:b\">A</p></body>";
+        assert_eq!(variant_chars(html, css, "F", 600, "normal"), "?Q");
+        assert_eq!(variant_chars(html, css, "F", 700, "normal"), "A");
+        assert_eq!(specificity(".a\\:b"), (0, 1, 0));
+    }
+
+    #[test]
+    fn revert_restores_the_user_agent_value() {
+        let css = "body{font-family:F}h3{font-weight:300}.r{font-weight:revert}";
+        let html = "<body><h3 class=r>Q?</h3></body>";
+        assert_eq!(variant_chars(html, css, "F", 700, "normal"), "?Q");
+    }
+
+    #[test]
+    fn generated_quotes_use_the_pseudo_element_font_and_quotes() {
+        let css = "body{font-family:Karla}q::before{font-family:Unbounded}\
+                   p{quotes:\"«\" \"»\"}p::before{content:open-quote}";
+        let html = "<body><q>Q?</q><p>P</p></body>";
+        let unbounded = variant_chars(html, css, "Unbounded", 400, "normal");
+        assert!(unbounded.contains('“'), "{unbounded}");
+        assert!(variant_chars(html, css, "Karla", 400, "normal").contains('«'));
+    }
+
+    // Malformed or unusual CSS must never panic: the analysis runs on every page.
+    #[test]
+    fn unusual_css_does_not_panic() {
+        let samples = [
+            "p[data-x=\":aaaaé\"]{font-weight:600}",
+            "é:hover{font-weight:600}",
+            "p:hové{font-weight:600}",
+            "a:hover\u{301}{font-weight:600}",
+            ":hover{font-weight:600}",
+            "p::befor{content:\"é\"}",
+            "p:é:before{content:\"é}",
+            "é::after{content:\"\\",
+            "@media{",
+            "}}}{{{p{font:",
+            "p{font:é é é}",
+            "p{font-weight:é;font-style:é;font-family:\"é}",
+            ":is(é,){font-weight:1}",
+            ":not({font-weight:1}",
+            "[é{font-weight:1}",
+            "p\\{font-weight:1}",
+            "p{content:\"\\110000\"}p::before{content:\"\\ffffff \\\"}",
+            "/* é",
+            "\"é",
+            "@layer é{@scope(é){@media é{p:hover:é::after{content:open-quote;quotes:\"é\"}}}}",
+        ];
+        for css in samples {
+            let html = "<body><p data-x=\":aaaaé\">é</p><q>q</q><a>a</a></body>";
+            let _ = collect_chars_per_font(html, css);
+            let _ = specificity(css);
+            let _ = strip_state_pseudo_classes(css);
+            let _ = split_pseudo_element(css);
+            let _ = component_values(css);
+        }
     }
 
     #[test]
