@@ -439,12 +439,13 @@ fn possible_winners_among<'a, T: Copy + PartialEq>(
             winners.push(candidate);
         }
     };
-    // revert-layer rolls back to the possible winners (conditional ones included) among
-    // lower layers of the same importance; an inline style rolls back to the
+    // revert-layer rolls back to the possible winners (conditional ones included) of
+    // everything below its layer in cascade order: lower layers of the same importance,
+    // then (for !important) every normal declaration; an inline style rolls back to the
     // stylesheets. The user-agent value (None) when there are none.
     let roll_back = |p: &Priority, push: &mut dyn FnMut(Option<T>)| {
         let (important, inline, layer) = (p.0, p.1, p.2.clone());
-        let lower = move |q: &Priority| q.0 == important && (q.1, &q.2) < (inline, &layer);
+        let lower = move |q: &Priority| (q.0, q.1, &q.2) < (important, inline, &layer);
         for candidate in possible_winners_among(rules, value, reverts_layer, &lower) {
             push(candidate);
         }
@@ -2578,6 +2579,21 @@ mod tests {
         let css = "body{font-family:F}p{font-family:Author!important}";
         let html = "<body><p style=\"font-family:revert-layer!important\">Q</p></body>";
         assert_eq!(variant_chars(html, css, "Author", 400, "normal"), "Q");
+    }
+
+    #[test]
+    fn important_revert_layer_falls_back_to_normal_declarations() {
+        // a layered !important revert-layer with no lower !important: the normal winner
+        let css = "body{font-family:F}@layer a,b;@layer a{p{font-weight:600}}\
+                   @layer b{p{font-weight:revert-layer!important}}";
+        assert_eq!(
+            variant_chars("<body><p>Q</p></body>", css, "F", 600, "normal"),
+            "Q"
+        );
+        // an inline !important revert-layer with no stylesheet !important: the normal winner
+        let css = "body{font-family:F}p{font-family:Sheet}";
+        let html = "<body><p style=\"font-family:revert-layer!important\">Q</p></body>";
+        assert_eq!(variant_chars(html, css, "Sheet", 400, "normal"), "Q");
     }
 
     #[test]
