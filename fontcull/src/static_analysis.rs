@@ -410,43 +410,60 @@ fn possible_winners<'a, T: Copy + PartialEq>(
     value: impl Fn(&'a FontStyleRule) -> Option<(T, bool)>,
     reverts_layer: impl Fn(T) -> bool,
 ) -> Vec<Option<T>> {
-    // The highest-priority unconditional declaration among those `allowed` admits.
-    let winner = |allowed: &dyn Fn(&Priority) -> bool| -> Option<(Priority, T)> {
-        let mut best: Option<(Priority, T)> = None;
-        for rule in rules.iter().filter(|rule| !rule.conditional) {
-            if let Some((v, important)) = value(rule) {
-                let p = rule.priority(important);
-                if allowed(&p) && best.as_ref().is_none_or(|(b, _)| p > *b) {
-                    best = Some((p, v));
-                }
-            }
-        }
-        best
-    };
-    // revert-layer rolls back to the winner among lower layers of the same importance.
-    let roll_back = |mut found: Option<(Priority, T)>| -> Option<T> {
-        while let Some((p, v)) = &found {
-            if !reverts_layer(*v) {
-                return Some(*v);
-            }
-            let (important, layer) = (p.0, p.2.clone());
-            found = winner(&|q: &Priority| q.0 == important && q.2 < layer);
-        }
-        None
-    };
-    let base = winner(&|_| true);
-    let base_priority = base.as_ref().map(|(p, _)| p.clone());
-    let mut winners = vec![roll_back(base)];
-    for rule in rules.iter().filter(|rule| rule.conditional) {
-        if let Some((v, important)) = value(rule) {
+    possible_winners_among(rules, &value, &reverts_layer, &|_| true)
+}
+
+/// The possible winners among declarations whose priority `allowed` admits.
+fn possible_winners_among<'a, T: Copy + PartialEq>(
+    rules: &[&'a FontStyleRule],
+    value: &dyn Fn(&'a FontStyleRule) -> Option<(T, bool)>,
+    reverts_layer: &dyn Fn(T) -> bool,
+    allowed: &dyn Fn(&Priority) -> bool,
+) -> Vec<Option<T>> {
+    // (priority, value, conditional, scoped)
+    let declarations: Vec<(Priority, T, bool, bool)> = rules
+        .iter()
+        .filter_map(|rule| {
+            let (v, important) = value(rule)?;
             let p = rule.priority(important);
-            if !(rule.scoped || base_priority.as_ref().is_none_or(|best| p > *best)) {
-                continue;
-            }
-            let candidate = roll_back(Some((p, v)));
-            if !winners.contains(&candidate) {
-                winners.push(candidate);
-            }
+            allowed(&p).then_some((p, v, rule.conditional, rule.scoped))
+        })
+        .collect();
+    let base = declarations
+        .iter()
+        .filter(|declaration| !declaration.2)
+        .max_by(|a, b| a.0.cmp(&b.0));
+    let mut winners: Vec<Option<T>> = Vec::new();
+    let mut push = |candidate: Option<T>| {
+        if !winners.contains(&candidate) {
+            winners.push(candidate);
+        }
+    };
+    // revert-layer rolls back to the possible winners (conditional ones included) among
+    // lower layers of the same importance; an inline style rolls back to the
+    // stylesheets. The user-agent value (None) when there are none.
+    let roll_back = |p: &Priority, push: &mut dyn FnMut(Option<T>)| {
+        let (important, inline, layer) = (p.0, p.1, p.2.clone());
+        let lower = move |q: &Priority| q.0 == important && (q.1, &q.2) < (inline, &layer);
+        for candidate in possible_winners_among(rules, value, reverts_layer, &lower) {
+            push(candidate);
+        }
+    };
+    match base {
+        Some((p, v, _, _)) if reverts_layer(*v) => roll_back(p, &mut push),
+        Some((_, v, _, _)) => push(Some(*v)),
+        None => push(None),
+    }
+    let base_priority = base.map(|(p, _, _, _)| p.clone());
+    for (p, v, _, scoped) in declarations.iter().filter(|declaration| declaration.2) {
+        // (scoped rules are always possible winners: proximity can beat source order)
+        if !(*scoped || base_priority.as_ref().is_none_or(|best| p > best)) {
+            continue;
+        }
+        if reverts_layer(*v) {
+            roll_back(p, &mut push);
+        } else {
+            push(Some(*v));
         }
     }
     winners
@@ -2545,6 +2562,22 @@ mod tests {
             variant_chars("<body><p>P</p></body>", css, "G", 400, "normal"),
             "P"
         );
+    }
+
+    #[test]
+    fn revert_layer_keeps_conditional_fonts_from_lower_layers() {
+        let css = "body{font-family:F}@layer a,b;@layer a{p{font-weight:400}@media(min-width:1px){p{font-weight:700}}}\
+                   @layer b{p{font-weight:revert-layer}}";
+        let html = "<body><p>Q</p></body>";
+        assert_eq!(variant_chars(html, css, "F", 400, "normal"), "Q");
+        assert_eq!(variant_chars(html, css, "F", 700, "normal"), "Q");
+    }
+
+    #[test]
+    fn inline_important_revert_layer_rolls_back_to_the_stylesheets() {
+        let css = "body{font-family:F}p{font-family:Author!important}";
+        let html = "<body><p style=\"font-family:revert-layer!important\">Q</p></body>";
+        assert_eq!(variant_chars(html, css, "Author", 400, "normal"), "Q");
     }
 
     #[test]
