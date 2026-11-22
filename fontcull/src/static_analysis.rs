@@ -92,6 +92,7 @@ pub fn collect_chars_per_font(
         parsed.rules.iter().partition(|rule| rule.pseudo.is_none());
     // Characters `open-quote`/`close-quote` can generate: the defaults and any `quotes`.
     let quote_chars = format!("{DEFAULT_QUOTES}{}", parsed.quote_chars);
+    let marker_chars = format!("{DEFAULT_MARKERS}{}", parsed.marker_chars);
 
     let mut per_family: HashMap<String, HashSet<char>> = HashMap::new();
     let mut per_variant: HashMap<FontVariantKey, HashSet<char>> = HashMap::new();
@@ -191,7 +192,7 @@ pub fn collect_chars_per_font(
                     content.push_str(&quote_chars)
                 }
                 // List item markers: bullets, or numbers for ordered lists.
-                (PseudoElement::Marker, "li") => content.push_str(DEFAULT_MARKERS),
+                (PseudoElement::Marker, "li") => content.push_str(&marker_chars),
                 _ => {}
             }
             if !content.trim().is_empty() {
@@ -631,6 +632,20 @@ fn parse_content(value: &str) -> Option<GeneratedContent> {
                     || word.eq_ignore_ascii_case("close-quote")
                 {
                     quotes = true;
+                } else if (word.eq_ignore_ascii_case("counter")
+                    || word.eq_ignore_ascii_case("counters"))
+                    && chars.next_if_eq(&'(').is_some()
+                {
+                    // counter(name, style): the counter's number in that list style
+                    let mut argument = String::new();
+                    while let Some(c) = chars.next() {
+                        match c {
+                            ')' => break,
+                            '"' | '\'' => text.push_str(&read_css_string(c, &mut chars)),
+                            _ => argument.push(c),
+                        }
+                    }
+                    text.push_str(&counter_chars(&argument.to_ascii_lowercase()));
                 } else if word.eq_ignore_ascii_case("attr") && chars.next_if_eq(&'(').is_some() {
                     // attr(name), attr(name type, "fallback"): the element's attribute value,
                     // and conservatively the fallback text too
@@ -659,11 +674,27 @@ fn parse_content(value: &str) -> Option<GeneratedContent> {
     })
 }
 
+/// Characters a `counter()`/`counters()` can render in the style its arguments name.
+fn counter_chars(arguments: &str) -> String {
+    let mut chars = String::from("0123456789-");
+    if arguments.contains("roman") {
+        chars.push_str("ivxlcdmIVXLCDM");
+    }
+    if arguments.contains("alpha") || arguments.contains("latin") {
+        chars.extend('a'..='z');
+        chars.extend('A'..='Z');
+    }
+    if arguments.contains("greek") {
+        chars.extend('α'..='ω');
+    }
+    chars
+}
+
 /// Read a CSS string's value after its opening `quote`, decoding escapes.
 fn read_css_string(quote: char, chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
     let mut text = String::new();
     while let Some(c) = chars.next() {
-        if c == quote {
+        if c == quote || c == '\n' {
             break;
         }
         if c != '\\' {
@@ -700,6 +731,8 @@ struct ParsedCss {
     quote_chars: String,
     /// Cascade layer names in order of first appearance; a layer's rank is its index + 1.
     layers: Vec<String>,
+    /// Characters of every string `list-style-type` marker.
+    marker_chars: String,
 }
 
 impl ParsedCss {
@@ -788,6 +821,7 @@ fn parse_css_rules(css: &str, css_vars: &CssVariables) -> ParsedCss {
         rules: Vec::new(),
         quote_chars: String::new(),
         layers: Vec::new(),
+        marker_chars: String::new(),
     };
     let css = strip_css_comments(css);
     parse_rule_list(&css, css_vars, Context::default(), &mut parsed);
@@ -807,7 +841,7 @@ fn strip_css_comments(css: &str) -> String {
                     if let Some(escaped) = chars.next() {
                         out.push(escaped);
                     }
-                } else if c == q {
+                } else if c == q || c == '\n' {
                     quote = None;
                 }
             }
@@ -851,7 +885,8 @@ fn scan_top_level(s: &str, mut visit: impl FnMut(usize, char, i32) -> bool) -> O
             continue;
         }
         if let Some(q) = quote {
-            if c == q {
+            // a string ends at its quote, or unterminated at a newline
+            if c == q || c == '\n' {
                 quote = None;
             }
             continue;
@@ -981,6 +1016,7 @@ fn parse_declarations(
     declarations: &str,
     css_vars: &CssVariables,
     quote_chars: &mut String,
+    marker_chars: &mut String,
 ) -> Declarations {
     let mut out = Declarations::default();
     for declaration in split_top_level(declarations, ';') {
@@ -1003,11 +1039,13 @@ fn parse_declarations(
             continue; // the next lower declaration wins
         }
         match name.as_str() {
-            "font-family" => declare(
-                &mut out.font_family,
-                parse_font_family_value_with_vars(value, css_vars),
-                important,
-            ),
+            "font-family" => {
+                // (an unresolved var() leaves no family: not a declaration)
+                let family = parse_font_family_value_with_vars(value, css_vars);
+                if !family.is_empty() {
+                    declare(&mut out.font_family, family, important);
+                }
+            }
             "font-weight" => {
                 if let Some(weight) = parse_font_weight(&resolve_css_var(value, css_vars)) {
                     declare(&mut out.font_weight, weight, important);
@@ -1055,6 +1093,22 @@ fn parse_declarations(
             "quotes" => {
                 if let Some(quotes) = parse_content(&resolve_css_var(value, css_vars)) {
                     quote_chars.push_str(&quotes.text);
+                }
+            }
+            "font-variant" | "font-variant-caps" => {
+                // small caps are drawn from uppercase forms when the font has none
+                let value = resolve_css_var(value, css_vars).to_ascii_lowercase();
+                if ["small-caps", "petite-caps", "unicase", "titling-caps"]
+                    .iter()
+                    .any(|caps| value.contains(caps))
+                {
+                    out.text_transform |= TRANSFORM_UPPER;
+                }
+            }
+            "list-style" | "list-style-type" => {
+                // a string marker, such as list-style-type: "✓ "
+                if let Some(marker) = parse_content(&resolve_css_var(value, css_vars)) {
+                    marker_chars.push_str(&marker.text);
                 }
             }
             "text-transform" => {
@@ -1155,7 +1209,12 @@ fn push_style_rules(
     for item in split_nested(block) {
         match item {
             BlockItem::Declarations(run) => {
-                let declarations = parse_declarations(run, css_vars, &mut parsed.quote_chars);
+                let declarations = parse_declarations(
+                    run,
+                    css_vars,
+                    &mut parsed.quote_chars,
+                    &mut parsed.marker_chars,
+                );
                 if declarations.is_empty() {
                     continue;
                 }
@@ -1203,15 +1262,25 @@ fn push_rule(
     if !generates && !declarations.sets_font() && declarations.text_transform == 0 {
         return; // `content` only applies to pseudo-elements
     }
-    let (variants, state_dependent) = strip_state_pseudo_classes(&base);
+    let (variants, mut state_dependent) = strip_state_pseudo_classes(&base);
+    let mut selectors: Vec<Selector> = variants
+        .iter()
+        .filter_map(|variant| Selector::parse(variant).ok())
+        .collect();
+    if selectors.is_empty() {
+        // A pseudo-class the matcher doesn't support (`:lang()`, `:nth-child(2 of .x)`):
+        // match without pseudo-classes, as a rule that may or may not apply.
+        selectors = variants
+            .iter()
+            .filter_map(|variant| Selector::parse(&strip_pseudo_classes(variant)).ok())
+            .collect();
+        state_dependent = true;
+    }
     let order = parsed.rules.len();
     let layer = parsed.rank_of(context);
     parsed.rules.push(FontStyleRule {
         specificity: specificity(&base),
-        parsed: variants
-            .iter()
-            .filter_map(|variant| Selector::parse(variant).ok())
-            .collect(),
+        parsed: selectors,
         selector: base,
         font_family: declarations.font_family.as_ref().map(|(v, _)| v.clone()),
         font_weight: declarations.font_weight.map(|(v, _)| v),
@@ -1237,7 +1306,7 @@ fn push_rule(
 /// A rule for an element's `style` attribute: it beats every selector rule of the same
 /// importance.
 fn inline_style_rule(style: &str, css_vars: &CssVariables) -> Option<FontStyleRule> {
-    let declarations = parse_declarations(style, css_vars, &mut String::new());
+    let declarations = parse_declarations(style, css_vars, &mut String::new(), &mut String::new());
     (declarations.sets_font() || declarations.text_transform != 0).then(|| FontStyleRule {
         selector: String::new(),
         font_family: declarations.font_family.as_ref().map(|(v, _)| v.clone()),
@@ -1319,7 +1388,7 @@ fn split_pseudo_element(selector: &str) -> (Option<String>, Target) {
 }
 
 /// Pseudo-classes for interaction states the static document never has.
-const STATE_PSEUDO_CLASSES: [&str; 7] = [
+const STATE_PSEUDO_CLASSES: [&str; 13] = [
     ":hover",
     ":focus-visible",
     ":focus-within",
@@ -1327,6 +1396,13 @@ const STATE_PSEUDO_CLASSES: [&str; 7] = [
     ":active",
     ":visited",
     ":target",
+    ":checked",
+    ":indeterminate",
+    ":popover-open",
+    ":placeholder-shown",
+    ":open",
+    // `[open]` on <details>/<dialog>: toggled without scripts
+    "[open]",
 ];
 
 /// Rewrite interaction-state pseudo-classes so the static document can be matched.
@@ -1338,7 +1414,9 @@ const STATE_PSEUDO_CLASSES: [&str; 7] = [
 fn strip_state_pseudo_classes(selector: &str) -> (Vec<String>, bool) {
     let mut found: Vec<(usize, usize, bool)> = Vec::new(); // (start, end, nested)
     scan_top_level(selector, |i, c, depth| {
-        if c != ':' || selector[i..].starts_with("::") || selector[..i].ends_with(':') {
+        let pseudo_class =
+            c == ':' && !selector[i..].starts_with("::") && !selector[..i].ends_with(':');
+        if !pseudo_class && c != '[' {
             return false;
         }
         let rest = &selector[i..];
@@ -1350,10 +1428,11 @@ fn strip_state_pseudo_classes(selector: &str) -> (Vec<String>, bool) {
             else {
                 continue;
             };
-            let ends_name = after
-                .chars()
-                .next()
-                .is_none_or(|c| !(c.is_alphanumeric() || c == '-' || c == '_' || c == '('));
+            let ends_name = state.ends_with(']')
+                || after
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '-' || c == '_' || c == '('));
             if ends_name {
                 found.push((i, i + state.len(), depth > 0));
                 break;
@@ -1365,15 +1444,18 @@ fn strip_state_pseudo_classes(selector: &str) -> (Vec<String>, bool) {
         return (vec![selector.to_string()], false);
     }
     let any_nested = found.iter().any(|(_, _, nested)| *nested);
-    let rewrite = |nested_state: &str| {
+    // `resting`: nested states never match; otherwise every state applies (removed).
+    let rewrite = |resting: bool| {
         let mut out = String::with_capacity(selector.len());
         let mut last = 0;
         for &(start, end, nested) in &found {
             out.push_str(&selector[last..start]);
-            if nested {
-                out.push_str(nested_state);
+            if nested && resting {
+                out.push_str(":not(*)");
             } else if out.is_empty()
-                || out.ends_with(|c: char| c.is_whitespace() || matches!(c, '>' | '+' | '~'))
+                || out.ends_with(|c: char| {
+                    c.is_whitespace() || matches!(c, '>' | '+' | '~' | '(' | ',')
+                })
             {
                 out.push('*');
             }
@@ -1382,11 +1464,55 @@ fn strip_state_pseudo_classes(selector: &str) -> (Vec<String>, bool) {
         out.push_str(&selector[last..]);
         out
     };
-    let mut variants = vec![rewrite(":not(*)")];
+    let mut variants = vec![rewrite(true)];
     if any_nested {
-        variants.push(rewrite("*"));
+        variants.push(rewrite(false));
     }
     (variants, true)
+}
+
+/// Remove every top-level pseudo-class (and its argument) from a selector.
+fn strip_pseudo_classes(selector: &str) -> String {
+    let mut starts = Vec::new();
+    scan_top_level(selector, |i, c, depth| {
+        if depth == 0
+            && c == ':'
+            && !selector[i..].starts_with("::")
+            && !selector[..i].ends_with(':')
+        {
+            starts.push(i);
+        }
+        false
+    });
+    let mut out = String::with_capacity(selector.len());
+    let mut last = 0;
+    for start in starts {
+        if start < last {
+            continue;
+        }
+        out.push_str(&selector[last..start]);
+        let rest = &selector[start + 1..];
+        let name_end = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(rest.len());
+        let mut end = start + 1 + name_end;
+        if selector[end..].starts_with('(') {
+            // the argument runs to its closing parenthesis
+            end = match scan_top_level(&selector[end + 1..], |_, c, depth| c == ')' && depth == -1)
+            {
+                Some(close) => end + 1 + close + 1,
+                None => selector.len(),
+            };
+        }
+        if out.is_empty()
+            || out.ends_with(|c: char| c.is_whitespace() || matches!(c, '>' | '+' | '~'))
+        {
+            out.push('*');
+        }
+        last = end;
+    }
+    out.push_str(&selector[last..]);
+    out
 }
 
 /// Approximate CSS selector specificity as (ids, classes/attributes/pseudo-classes, types).
@@ -1680,53 +1806,31 @@ fn resolve_css_var(value: &str, css_vars: &CssVariables) -> String {
 /// Returns a map of --property-name -> value
 fn parse_css_custom_properties(css: &str) -> CssVariables {
     let mut vars = HashMap::new();
-
-    // Parse through CSS looking for custom property declarations
-    let mut remaining = css;
-
-    while let Some(brace_start) = remaining.find('{') {
-        let after_brace = &remaining[brace_start + 1..];
-
-        // Find matching closing brace
-        let mut depth = 1;
-        let mut block_end = None;
-        for (i, c) in after_brace.char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        block_end = Some(i);
-                        break;
+    let css = strip_css_comments(css);
+    // Every declaration list, at any depth (inside @media, @layer and @supports too):
+    // the text before a `}` back to the previous `{`, `}` or `;`-run start.
+    let mut list_start = 0;
+    scan_top_level(&css, |i, c, _| {
+        match c {
+            '{' => list_start = i + 1,
+            '}' => {
+                for declaration in split_top_level(&css[list_start..i], ';') {
+                    let declaration = declaration.trim();
+                    if declaration.starts_with("--")
+                        && let Some(colon) = declaration.find(':')
+                    {
+                        let name = declaration[..colon].trim();
+                        let value = declaration[colon + 1..].trim();
+                        // (the last definition wins; selector-scoped overrides are not tracked)
+                        vars.insert(name.to_string(), value.to_string());
                     }
                 }
-                _ => {}
+                list_start = i + 1;
             }
+            _ => {}
         }
-
-        let Some(end) = block_end else {
-            break;
-        };
-
-        let block = &after_brace[..end];
-
-        // Parse declarations in this block
-        for declaration in block.split(';') {
-            let declaration = declaration.trim();
-
-            // Look for custom property declarations (--name: value)
-            if declaration.starts_with("--")
-                && let Some(colon_pos) = declaration.find(':')
-            {
-                let name = declaration[..colon_pos].trim();
-                let value = declaration[colon_pos + 1..].trim();
-                vars.insert(name.to_string(), value.to_string());
-            }
-        }
-
-        remaining = &after_brace[end + 1..];
-    }
-
+        false
+    });
     vars
 }
 
@@ -2185,6 +2289,81 @@ mod tests {
             ),
             "?Q"
         );
+    }
+
+    #[test]
+    fn first_letter_wins_over_a_more_specific_element_rule() {
+        let css = ".prose p{font-family:F}p::first-letter{font-family:Drop}";
+        let html = "<body><div class=prose><p>Abc</p></div></body>";
+        assert_eq!(variant_chars(html, css, "Drop", 400, "normal"), "Abc");
+    }
+
+    #[test]
+    fn state_pseudo_classes_in_has_and_nested_parents_can_match() {
+        let css = "body{font-family:F}.card:has(a:hover) h3{font-weight:800}\
+                   :is(.x:hover) span{font-style:italic}.btn:hover{.icon{font-weight:600}}";
+        let html = "<body><div class=card><a>l</a><h3>H</h3></div><p class=x><span>S</span></p>\
+                    <span class=btn><span class=icon>I</span></span></body>";
+        assert_eq!(variant_chars(html, css, "F", 800, "normal"), "H");
+        assert_eq!(variant_chars(html, css, "F", 400, "italic"), "S");
+        assert_eq!(variant_chars(html, css, "F", 600, "normal"), "I");
+    }
+
+    #[test]
+    fn later_layers_beat_more_specific_earlier_ones() {
+        let css = "body{font-family:F}@layer base, utilities;@layer utilities{.font-x{font-family:X}}\
+                   @layer base{.card h2{font-family:B}}";
+        let html = "<body><div class=card><h2 class=font-x>T</h2></div></body>";
+        assert_eq!(variant_chars(html, css, "X", 700, "normal"), "T");
+    }
+
+    #[test]
+    fn custom_properties_inside_at_rules_and_unresolved_vars() {
+        let css = "@layer theme{:root{--font-sans:Inter}}body{font-family:var(--font-sans)}\
+                   p{font-family:var(--missing)}";
+        let html = "<body><p>P</p></body>";
+        assert_eq!(variant_chars(html, css, "Inter", 400, "normal"), "P");
+    }
+
+    #[test]
+    fn counters_render_digits() {
+        let css = "body{font-family:F}li::after{content:counter(s) \". \"}ol::before{content:counter(n, upper-roman)}";
+        let html = "<body><ol><li>x</li></ol></body>";
+        let chars = variant_chars(html, css, "F", 400, "normal");
+        assert!(
+            chars.contains('7') && chars.contains('.') && chars.contains('X'),
+            "{chars}"
+        );
+    }
+
+    #[test]
+    fn css_only_toggles_count_both_ways() {
+        let css = "body{font-family:F}input:checked+label{font-weight:700}details[open] summary{font-style:italic}";
+        let html = "<body><input type=checkbox><label>L</label><details><summary>S</summary></details></body>";
+        assert_eq!(variant_chars(html, css, "F", 700, "normal"), "L");
+        assert_eq!(variant_chars(html, css, "F", 400, "italic"), "S");
+    }
+
+    #[test]
+    fn unsupported_pseudo_classes_still_match() {
+        let css =
+            "body{font-family:F}p:lang(en){font-weight:700}li:nth-child(2 of .k){font-weight:600}";
+        let html = "<body><p lang=en>P</p><ul><li class=k>A</li><li class=k>B</li></ul></body>";
+        assert_eq!(variant_chars(html, css, "F", 700, "normal"), "P");
+        assert!(variant_chars(html, css, "F", 600, "normal").contains('B'));
+    }
+
+    #[test]
+    fn string_markers_small_caps_and_unterminated_strings() {
+        let css = "body{font-family:F}ul{list-style-type:\"\\2713  \"}.sc{font-variant:small-caps}\
+                   p::after{content:\"x\n}.after{font-weight:700}";
+        let html = "<body><ul><li>i</li></ul><p class=sc>ab</p><span class=after>A</span></body>";
+        let normal = variant_chars(html, css, "F", 400, "normal");
+        assert!(
+            normal.contains('✓') && normal.contains('A') && normal.contains('B'),
+            "{normal}"
+        );
+        assert_eq!(variant_chars(html, css, "F", 700, "normal"), "A");
     }
 
     #[test]
