@@ -202,6 +202,25 @@ pub fn collect_chars_per_font(
             }
         }
 
+        // ::first-letter/::first-line style the start of the element's text, which may
+        // be inside descendants: conservatively count all of it in their font.
+        let first_text: Vec<&FontStyleRule> = pseudo_rules
+            .iter()
+            .copied()
+            .filter(|rule| {
+                rule.pseudo == Some(PseudoElement::FirstText) && rule.selector_matches(&element)
+            })
+            .collect();
+        if !first_text.is_empty() {
+            let text: String = element.text().collect();
+            if !text.trim().is_empty() {
+                let transform = first_text
+                    .iter()
+                    .fold(transform, |transform, rule| transform | rule.text_transform);
+                add(&cascade(&styles, None, &first_text), &text, transform);
+            }
+        }
+
         resolved.insert(element.id(), (styles, transform));
     }
 
@@ -215,8 +234,9 @@ const DEFAULT_MARKERS: &str = "\u{2022}\u{25E6}\u{25AA}0123456789. ";
 const DEFAULT_QUOTES: &str = "\u{201C}\u{201D}\u{2018}\u{2019}";
 
 /// At most this many possible fonts are tracked per element; conditional rules
-/// rarely produce more than a handful.
-const MAX_POSSIBLE_STYLES: usize = 64;
+/// rarely produce more than a handful. Candidates are deduplicated first, so the
+/// limit only applies to genuinely different fonts.
+const MAX_POSSIBLE_STYLES: usize = 256;
 
 /// Resolved font styling for an element.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +262,9 @@ enum PseudoElement {
     Before,
     After,
     Marker,
+    /// `::first-letter`/`::first-line`: restyles part of the element's (and its
+    /// descendants') text.
+    FirstText,
 }
 
 /// Uppercase or lowercase forms a `text-transform` can add.
@@ -287,36 +310,41 @@ struct FontStyleRule {
     /// Inside `@media`/`@supports`/`@container`/`@scope`, or matching only in an
     /// interaction state: the rule may or may not apply.
     conditional: bool,
-    /// Inside `@layer`: unlayered normal declarations beat it, layered `!important` ones
-    /// beat unlayered `!important` ones.
-    layered: bool,
+    /// The rank of its `@layer` (by first appearance), or `None` when unlayered.
+    layer: Option<u32>,
+    /// Inside `@scope`: scope proximity can make it win over later rules, so it is
+    /// always a possible winner.
+    scoped: bool,
+    /// An element's `style` attribute.
+    inline: bool,
     specificity: (u32, u32, u32),
     order: usize,
-    /// The selector parsed for matching (top-level state pseudo-classes removed).
-    parsed: Option<Selector>,
+    /// The selector parsed for matching, in each interaction state it distinguishes
+    /// (top-level state pseudo-classes removed); it matches if any variant matches.
+    parsed: Vec<Selector>,
 }
 
 impl FontStyleRule {
     fn selector_matches(&self, element: &scraper::ElementRef) -> bool {
-        self.parsed
-            .as_ref()
-            .is_some_and(|selector| selector.matches(element))
+        self.parsed.iter().any(|selector| selector.matches(element))
     }
 
-    /// Cascade order of one of this rule's declarations: importance, layer, specificity,
-    /// source order.
+    /// Cascade order of one of this rule's declarations: importance, inline style,
+    /// cascade layer, specificity, source order.
     fn priority(&self, important: bool) -> Priority {
-        // Layers reverse for important declarations.
-        let layer = if important {
-            self.layered
-        } else {
-            !self.layered
+        // Unlayered normal declarations beat layered ones and later layers beat earlier
+        // ones; both reverse for important declarations.
+        let layer = match (important, self.layer) {
+            (false, None) => u32::MAX,
+            (false, Some(rank)) => rank,
+            (true, None) => 0,
+            (true, Some(rank)) => u32::MAX - rank,
         };
-        (important, layer, self.specificity, self.order)
+        (important, self.inline, layer, self.specificity, self.order)
     }
 }
 
-type Priority = (bool, bool, (u32, u32, u32), usize);
+type Priority = (bool, bool, u32, (u32, u32, u32), usize);
 
 /// The user-agent origin's font for an element of `tag`, inheriting `parent`.
 fn user_agent_style(parent: &ResolvedFontStyle, tag: Option<&str>) -> ResolvedFontStyle {
@@ -341,7 +369,7 @@ fn user_agent_style(parent: &ResolvedFontStyle, tag: Option<&str>) -> ResolvedFo
 
 /// The declarations of one property that can win: the highest-priority unconditional
 /// one (if any), and every conditional one that would beat it.
-fn possible_winners<'a, T: Copy>(
+fn possible_winners<'a, T: Copy + PartialEq>(
     rules: &[&'a FontStyleRule],
     value: impl Fn(&'a FontStyleRule) -> Option<(T, bool)>,
 ) -> Vec<Option<T>> {
@@ -357,7 +385,8 @@ fn possible_winners<'a, T: Copy>(
     let mut winners = vec![base.map(|(_, v)| v)];
     for rule in rules.iter().filter(|rule| rule.conditional) {
         if let Some((v, important)) = value(rule)
-            && base.is_none_or(|(best, _)| rule.priority(important) > best)
+            && (rule.scoped || base.is_none_or(|(best, _)| rule.priority(important) > best))
+            && !winners.contains(&Some(v))
         {
             winners.push(Some(v));
         }
@@ -456,8 +485,8 @@ fn lighter(parent: u16) -> u16 {
 enum CssWideKeyword {
     /// `inherit`, and `unset`, which inherits for these inherited properties.
     Inherit,
-    /// `revert` and `revert-layer`: the user-agent origin's value (layers are not
-    /// distinguished).
+    /// `revert`: the user-agent origin's value. (`revert-layer` declarations are dropped
+    /// at parse time, so the next lower declaration wins.)
     Revert,
     Initial,
 }
@@ -465,7 +494,7 @@ enum CssWideKeyword {
 fn css_wide_keyword(value: &str) -> Option<CssWideKeyword> {
     match value.trim().to_ascii_lowercase().as_str() {
         "inherit" | "unset" => Some(CssWideKeyword::Inherit),
-        "revert" | "revert-layer" => Some(CssWideKeyword::Revert),
+        "revert" => Some(CssWideKeyword::Revert),
         "initial" => Some(CssWideKeyword::Initial),
         _ => None,
     }
@@ -603,10 +632,15 @@ fn parse_content(value: &str) -> Option<GeneratedContent> {
                 {
                     quotes = true;
                 } else if word.eq_ignore_ascii_case("attr") && chars.next_if_eq(&'(').is_some() {
-                    // attr(name) or attr(name type, fallback): the element's attribute value
+                    // attr(name), attr(name type, "fallback"): the element's attribute value,
+                    // and conservatively the fallback text too
                     let mut argument = String::new();
-                    while let Some(c) = chars.next_if(|c| *c != ')') {
-                        argument.push(c);
+                    while let Some(c) = chars.next() {
+                        match c {
+                            ')' => break,
+                            '"' | '\'' => text.push_str(&read_css_string(c, &mut chars)),
+                            _ => argument.push(c),
+                        }
                     }
                     if let Some(name) = argument.split([',', ' ']).next()
                         && !name.trim().is_empty()
@@ -664,6 +698,80 @@ struct ParsedCss {
     rules: Vec<FontStyleRule>,
     /// Characters of every `quotes` declaration.
     quote_chars: String,
+    /// Cascade layer names in order of first appearance; a layer's rank is its index + 1.
+    layers: Vec<String>,
+}
+
+impl ParsedCss {
+    fn layer_rank(&mut self, name: &str) -> u32 {
+        let index = match self.layers.iter().position(|layer| layer == name) {
+            Some(index) => index,
+            None => {
+                self.layers.push(name.to_string());
+                self.layers.len() - 1
+            }
+        };
+        u32::try_from(index + 1)
+            .unwrap_or(u32::MAX - 1)
+            .min(u32::MAX - 1)
+    }
+
+    /// The context inside an at-rule block, or `None` for at-rules whose contents are
+    /// not page styles (`@font-face`, `@keyframes`, `@page`, …).
+    fn at_rule_context(&mut self, at_rule: &str, context: &Context) -> Option<Context> {
+        let name_end = at_rule
+            .find(|c: char| c.is_whitespace() || c == '(')
+            .unwrap_or(at_rule.len());
+        match at_rule[..name_end].to_ascii_lowercase().as_str() {
+            "media" | "supports" | "container" | "document" | "-moz-document" => Some(Context {
+                conditional: true,
+                ..context.clone()
+            }),
+            "scope" => Some(Context {
+                conditional: true,
+                scoped: true,
+                ..context.clone()
+            }),
+            "layer" => {
+                let name = at_rule[name_end..].trim();
+                let name = if name.is_empty() {
+                    format!("\0anonymous{}", self.layers.len())
+                } else {
+                    name.to_string()
+                };
+                let full = self.layer_name(context, &name);
+                self.layer_rank(&full);
+                Some(Context {
+                    layer: Some(full),
+                    ..context.clone()
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn layer_name(&self, context: &Context, name: &str) -> String {
+        match &context.layer {
+            Some(parent) => format!("{parent}.{name}"),
+            None => name.to_string(),
+        }
+    }
+
+    /// `@layer a, b;` declares the layers' order.
+    fn declare_layers(&mut self, names: &str, context: &Context) {
+        for name in names
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            let full = self.layer_name(context, name);
+            self.layer_rank(&full);
+        }
+    }
+
+    fn rank_of(&mut self, context: &Context) -> Option<u32> {
+        context.layer.clone().map(|layer| self.layer_rank(&layer))
+    }
 }
 
 /// Parse CSS and extract rules that set font-family, font-weight, font-style or the
@@ -679,6 +787,7 @@ fn parse_css_rules(css: &str, css_vars: &CssVariables) -> ParsedCss {
     let mut parsed = ParsedCss {
         rules: Vec::new(),
         quote_chars: String::new(),
+        layers: Vec::new(),
     };
     let css = strip_css_comments(css);
     parse_rule_list(&css, css_vars, Context::default(), &mut parsed);
@@ -792,10 +901,12 @@ fn split_top_level(s: &str, separator: char) -> Vec<&str> {
 }
 
 /// The at-rule context of a rule list.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct Context {
     conditional: bool,
-    layered: bool,
+    scoped: bool,
+    /// The full name of the enclosing cascade layer.
+    layer: Option<String>,
 }
 
 fn parse_rule_list(css: &str, css_vars: &CssVariables, context: Context, parsed: &mut ParsedCss) {
@@ -810,6 +921,9 @@ fn parse_rule_list(css: &str, css_vars: &CssVariables, context: Context, parsed:
         };
         if !rest[open..].starts_with('{') {
             // a statement at-rule (`@import …;`, `@layer a, b;`), or a stray `;`/`}`
+            if let Some(names) = rest[..open].trim().strip_prefix("@layer") {
+                parsed.declare_layers(names, &context);
+            }
             rest = &rest[open + 1..];
             continue;
         }
@@ -822,28 +936,12 @@ fn parse_rule_list(css: &str, css_vars: &CssVariables, context: Context, parsed:
         rest = &after_open[close + 1..];
 
         if let Some(at_rule) = prelude.strip_prefix('@') {
-            let name = at_rule
-                .split(|c: char| c.is_whitespace() || c == '(')
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            let inner = match name.as_str() {
-                "media" | "supports" | "container" | "scope" | "document" | "-moz-document" => {
-                    Context {
-                        conditional: true,
-                        ..context
-                    }
-                }
-                "layer" => Context {
-                    layered: true,
-                    ..context
-                },
-                _ => continue, // @font-face, @keyframes, @page, @property, …
-            };
-            parse_rule_list(block, css_vars, inner, parsed);
+            if let Some(inner) = parsed.at_rule_context(at_rule, &context) {
+                parse_rule_list(block, css_vars, inner, parsed);
+            }
             continue;
         }
-        push_style_rules(prelude, block, css_vars, context, parsed);
+        push_style_rules(prelude, block, css_vars, &context, parsed);
     }
 }
 
@@ -898,6 +996,12 @@ fn parse_declarations(
             value = value[..bang].trim_end();
             important = true;
         }
+        if resolve_css_var(value, css_vars)
+            .trim()
+            .eq_ignore_ascii_case("revert-layer")
+        {
+            continue; // the next lower declaration wins
+        }
         match name.as_str() {
             "font-family" => declare(
                 &mut out.font_family,
@@ -935,7 +1039,19 @@ fn parse_declarations(
                     declare(&mut out.font_style, value, important);
                 }
             }
-            "content" => out.content = parse_content(&resolve_css_var(value, css_vars)),
+            "content" => {
+                // Conservatively union every content value in the block.
+                if let Some(content) = parse_content(&resolve_css_var(value, css_vars)) {
+                    match &mut out.content {
+                        Some(existing) => {
+                            existing.text.push_str(&content.text);
+                            existing.quotes |= content.quotes;
+                            existing.attrs.extend(content.attrs);
+                        }
+                        None => out.content = Some(content),
+                    }
+                }
+            }
             "quotes" => {
                 if let Some(quotes) = parse_content(&resolve_css_var(value, css_vars)) {
                     quote_chars.push_str(&quotes.text);
@@ -957,41 +1073,71 @@ fn parse_declarations(
     out
 }
 
-/// A rule's declarations and its nested rules (CSS nesting), as `(prelude, block)`.
-fn split_nested(block: &str) -> (String, Vec<(&str, &str)>) {
-    let mut declarations = String::new();
-    let mut nested = Vec::new();
-    let mut rest = block;
-    while let Some(i) = find_top_level(rest, &['{', ';']) {
-        if rest[i..].starts_with(';') {
-            declarations.push_str(&rest[..=i]);
-            rest = &rest[i + 1..];
-            continue;
-        }
-        let prelude = rest[..i].trim();
-        let after = &rest[i + 1..];
-        let Some(close) = find_block_end(after) else {
-            return (declarations, nested);
-        };
-        nested.push((prelude, &after[..close]));
-        rest = &after[close + 1..];
-    }
-    declarations.push_str(rest);
-    (declarations, nested)
+/// A rule block's contents in order: runs of declarations and nested rules.
+enum BlockItem<'a> {
+    Declarations(&'a str),
+    Nested(&'a str, &'a str),
 }
 
-/// A nested rule's selector list against its parent's (`&` is the parent).
+/// Split a rule's block into declaration runs and nested rules (CSS nesting), in order.
+fn split_nested(block: &str) -> Vec<BlockItem<'_>> {
+    let mut items = Vec::new();
+    let mut rest = block;
+    let mut offset = 0;
+    while let Some(i) = find_top_level(&rest[offset..], &['{', ';']).map(|i| i + offset) {
+        if rest[i..].starts_with(';') {
+            offset = i + 1;
+            continue;
+        }
+        // The nested rule's prelude starts after the run's last `;`.
+        let prelude_start = rest[..i].rfind(';').map_or(0, |j| j + 1);
+        if !rest[..prelude_start].trim().is_empty() {
+            items.push(BlockItem::Declarations(&rest[..prelude_start]));
+        }
+        let after = &rest[i + 1..];
+        let Some(close) = find_block_end(after) else {
+            return items;
+        };
+        items.push(BlockItem::Nested(
+            rest[prelude_start..i].trim(),
+            &after[..close],
+        ));
+        rest = &after[close + 1..];
+        offset = 0;
+    }
+    if !rest.trim().is_empty() {
+        items.push(BlockItem::Declarations(rest));
+    }
+    items
+}
+
+/// A nested rule's selector list against its parent's (`&` is the parent, anywhere in
+/// the selector, including inside functional pseudo-classes).
 fn nest_selector(parent: &str, nested: &str) -> String {
+    let parent = format!(":is({parent})");
     split_top_level(nested, ',')
         .into_iter()
         .map(|selector| {
             let selector = selector.trim();
-            let parent = format!(":is({parent})");
-            if find_top_level(selector, &['&']).is_some() {
-                selector.replace('&', &parent)
-            } else {
-                format!("{parent} {selector}")
+            let mut ampersands = Vec::new();
+            scan_top_level(selector, |i, c, _| {
+                if c == '&' {
+                    ampersands.push(i);
+                }
+                false
+            });
+            if ampersands.is_empty() {
+                return format!("{parent} {selector}");
             }
+            let mut out = String::new();
+            let mut last = 0;
+            for i in ampersands {
+                out.push_str(&selector[last..i]);
+                out.push_str(&parent);
+                last = i + 1;
+            }
+            out.push_str(&selector[last..]);
+            out
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -1001,42 +1147,35 @@ fn push_style_rules(
     prelude: &str,
     block: &str,
     css_vars: &CssVariables,
-    context: Context,
+    context: &Context,
     parsed: &mut ParsedCss,
 ) {
-    let (declarations, nested) = split_nested(block);
-    let declarations = parse_declarations(&declarations, css_vars, &mut parsed.quote_chars);
-    if !declarations.is_empty() {
-        for selector in split_top_level(prelude, ',') {
-            let selector = selector.trim();
-            if selector.is_empty() || selector.starts_with('@') {
-                continue;
+    // Each declaration run becomes its own rules in source order, so declarations
+    // after a nested rule still come after it.
+    for item in split_nested(block) {
+        match item {
+            BlockItem::Declarations(run) => {
+                let declarations = parse_declarations(run, css_vars, &mut parsed.quote_chars);
+                if declarations.is_empty() {
+                    continue;
+                }
+                for selector in split_top_level(prelude, ',') {
+                    let selector = selector.trim();
+                    if !selector.is_empty() && !selector.starts_with('@') {
+                        push_rule(selector, &declarations, context, parsed);
+                    }
+                }
             }
-            push_rule(selector, &declarations, context, parsed);
-        }
-    }
-    for (nested_prelude, nested_block) in nested {
-        if let Some(at_rule) = nested_prelude.strip_prefix('@') {
-            let name = at_rule
-                .split(|c: char| c.is_whitespace() || c == '(')
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            let inner = match name.as_str() {
-                "media" | "supports" | "container" | "scope" => Context {
-                    conditional: true,
-                    ..context
-                },
-                "layer" => Context {
-                    layered: true,
-                    ..context
-                },
-                _ => continue,
-            };
-            push_style_rules(prelude, nested_block, css_vars, inner, parsed);
-        } else {
-            let selector = nest_selector(prelude, nested_prelude);
-            push_style_rules(&selector, nested_block, css_vars, context, parsed);
+            BlockItem::Nested(nested_prelude, nested_block) => {
+                if let Some(at_rule) = nested_prelude.strip_prefix('@') {
+                    if let Some(inner) = parsed.at_rule_context(at_rule, context) {
+                        push_style_rules(prelude, nested_block, css_vars, &inner, parsed);
+                    }
+                } else {
+                    let selector = nest_selector(prelude, nested_prelude);
+                    push_style_rules(&selector, nested_block, css_vars, context, parsed);
+                }
+            }
         }
     }
 }
@@ -1045,7 +1184,7 @@ fn push_style_rules(
 fn push_rule(
     selector: &str,
     declarations: &Declarations,
-    context: Context,
+    context: &Context,
     parsed: &mut ParsedCss,
 ) {
     let (base, target) = split_pseudo_element(selector);
@@ -1054,16 +1193,25 @@ fn push_rule(
     };
     let pseudo = match target {
         Target::Pseudo(pseudo) => Some(pseudo),
-        Target::Element | Target::PartOfText => None,
+        Target::PartOfText => Some(PseudoElement::FirstText),
+        Target::Element => None,
     };
-    if pseudo.is_none() && !declarations.sets_font() && declarations.text_transform == 0 {
+    let generates = matches!(
+        pseudo,
+        Some(PseudoElement::Before | PseudoElement::After | PseudoElement::Marker)
+    );
+    if !generates && !declarations.sets_font() && declarations.text_transform == 0 {
         return; // `content` only applies to pseudo-elements
     }
-    let (matchable, state_dependent) = strip_state_pseudo_classes(&base);
+    let (variants, state_dependent) = strip_state_pseudo_classes(&base);
     let order = parsed.rules.len();
+    let layer = parsed.rank_of(context);
     parsed.rules.push(FontStyleRule {
         specificity: specificity(&base),
-        parsed: Selector::parse(&matchable).ok(),
+        parsed: variants
+            .iter()
+            .filter_map(|variant| Selector::parse(variant).ok())
+            .collect(),
         selector: base,
         font_family: declarations.font_family.as_ref().map(|(v, _)| v.clone()),
         font_weight: declarations.font_weight.map(|(v, _)| v),
@@ -1071,21 +1219,23 @@ fn push_rule(
         family_important: declarations.font_family.as_ref().is_some_and(|(_, i)| *i),
         weight_important: declarations.font_weight.is_some_and(|(_, i)| i),
         style_important: declarations.font_style.as_ref().is_some_and(|(_, i)| *i),
-        content: if pseudo.is_some() {
+        content: if generates {
             declarations.content.clone()
         } else {
             None
         },
         text_transform: declarations.text_transform,
         pseudo,
-        // ::first-letter and ::first-line restyle part of the element's own text
-        conditional: context.conditional || state_dependent || target == Target::PartOfText,
-        layered: context.layered,
+        conditional: context.conditional || state_dependent,
+        layer,
+        scoped: context.scoped,
+        inline: false,
         order,
     });
 }
 
-/// A rule for an element's `style` attribute: it beats every selector.
+/// A rule for an element's `style` attribute: it beats every selector rule of the same
+/// importance.
 fn inline_style_rule(style: &str, css_vars: &CssVariables) -> Option<FontStyleRule> {
     let declarations = parse_declarations(style, css_vars, &mut String::new());
     (declarations.sets_font() || declarations.text_transform != 0).then(|| FontStyleRule {
@@ -1100,10 +1250,12 @@ fn inline_style_rule(style: &str, css_vars: &CssVariables) -> Option<FontStyleRu
         text_transform: declarations.text_transform,
         pseudo: None,
         conditional: false,
-        layered: false,
-        specificity: (u32::MAX, 0, 0),
+        layer: None,
+        scoped: false,
+        inline: true,
+        specificity: (0, 0, 0),
         order: usize::MAX,
-        parsed: None,
+        parsed: Vec::new(),
     })
 }
 
@@ -1178,11 +1330,12 @@ const STATE_PSEUDO_CLASSES: [&str; 7] = [
 ];
 
 /// Rewrite interaction-state pseudo-classes so the static document can be matched.
-/// Top-level ones are removed, matching as if the state applied; ones inside functional
-/// pseudo-classes such as `:not(:hover)` become the never-matching `:not(*)`, the
-/// document's resting state. Returns the selector to match and whether it depends on a
-/// state (then the rule may or may not apply).
-fn strip_state_pseudo_classes(selector: &str) -> (String, bool) {
+/// Top-level ones are removed, matching as if the state applied. Ones inside functional
+/// pseudo-classes (`:not(:hover)`, `:is(:focus)`) give two variants: the resting state
+/// (`:not(*)`, never matching) and the active state (`*`). Returns the selectors to
+/// match (the rule matches if any does) and whether it depends on a state (then the
+/// rule may or may not apply).
+fn strip_state_pseudo_classes(selector: &str) -> (Vec<String>, bool) {
     let mut found: Vec<(usize, usize, bool)> = Vec::new(); // (start, end, nested)
     scan_top_level(selector, |i, c, depth| {
         if c != ':' || selector[i..].starts_with("::") || selector[..i].ends_with(':') {
@@ -1209,23 +1362,31 @@ fn strip_state_pseudo_classes(selector: &str) -> (String, bool) {
         false
     });
     if found.is_empty() {
-        return (selector.to_string(), false);
+        return (vec![selector.to_string()], false);
     }
-    let mut out = String::with_capacity(selector.len());
-    let mut last = 0;
-    for (start, end, nested) in found {
-        out.push_str(&selector[last..start]);
-        if nested {
-            out.push_str(":not(*)");
-        } else if out.is_empty()
-            || out.ends_with(|c: char| c.is_whitespace() || matches!(c, '>' | '+' | '~'))
-        {
-            out.push('*');
+    let any_nested = found.iter().any(|(_, _, nested)| *nested);
+    let rewrite = |nested_state: &str| {
+        let mut out = String::with_capacity(selector.len());
+        let mut last = 0;
+        for &(start, end, nested) in &found {
+            out.push_str(&selector[last..start]);
+            if nested {
+                out.push_str(nested_state);
+            } else if out.is_empty()
+                || out.ends_with(|c: char| c.is_whitespace() || matches!(c, '>' | '+' | '~'))
+            {
+                out.push('*');
+            }
+            last = end;
         }
-        last = end;
+        out.push_str(&selector[last..]);
+        out
+    };
+    let mut variants = vec![rewrite(":not(*)")];
+    if any_nested {
+        variants.push(rewrite("*"));
     }
-    out.push_str(&selector[last..]);
-    (out, true)
+    (variants, true)
 }
 
 /// Approximate CSS selector specificity as (ids, classes/attributes/pseudo-classes, types).
@@ -1240,7 +1401,7 @@ fn specificity(selector: &str) -> (u32, u32, u32) {
     let skip_identifier = |mut i: usize| {
         while i < chars.len() {
             if chars[i] == '\\' {
-                i += 2;
+                i = (i + 2).min(chars.len());
             } else if identifier(chars[i]) {
                 i += 1;
             } else {
@@ -1925,6 +2086,105 @@ mod tests {
         let html = "<body><h1>H</h1></body>";
         assert_eq!(variant_chars(html, css, "A", 800, "normal"), "H");
         assert_eq!(variant_chars(html, css, "A", 700, "normal"), "H");
+    }
+
+    #[test]
+    fn duplicate_conditional_rules_stay_fast() {
+        let css = format!(
+            "body{{font-family:F}}{}",
+            "@media(min-width:1px){p{font-family:F;font-weight:400;font-style:normal}}".repeat(100)
+        );
+        let html = format!("<body>{}</body>", "<p>Q?</p>".repeat(200));
+        let started = std::time::Instant::now();
+        assert_eq!(variant_chars(&html, &css, "F", 400, "normal"), "?Q");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn layer_order_and_inline_importance() {
+        let css = "body{font-family:F}@layer a,b;@layer a{#x{font-weight:600}}@layer b{p{font-weight:400}}\
+                   @layer a{.i{font-weight:700!important}}";
+        let html =
+            "<body><p id=x>Q?</p><p class=i style=\"font-weight:300!important\">I</p></body>";
+        assert_eq!(variant_chars(html, css, "F", 400, "normal"), "?Q");
+        assert_eq!(variant_chars(html, css, "F", 300, "normal"), "I");
+    }
+
+    #[test]
+    fn scoped_rules_can_win_over_later_rules() {
+        let css = "body{font-family:F}@scope(.card){p{font-weight:700}}p{font-weight:400}";
+        let html = "<body><div class=card><p>Q?</p></div></body>";
+        assert_eq!(variant_chars(html, css, "F", 700, "normal"), "?Q");
+    }
+
+    #[test]
+    fn revert_layer_falls_back_to_the_lower_layer() {
+        let css = "body{font-family:F}@layer a,b;@layer a{p{font-weight:600}}@layer b{p{font-weight:revert-layer}}";
+        assert_eq!(
+            variant_chars("<body><p>Q?</p></body>", css, "F", 600, "normal"),
+            "?Q"
+        );
+    }
+
+    #[test]
+    fn positive_functional_state_selectors_can_match() {
+        let css = "body{font-family:F}p:is(:hover){font-weight:700}";
+        let html = "<body><p>Q?</p></body>";
+        assert_eq!(variant_chars(html, css, "F", 700, "normal"), "?Q");
+        assert_eq!(variant_chars(html, css, "F", 400, "normal"), "?Q");
+    }
+
+    #[test]
+    fn every_content_value_in_a_block_counts() {
+        let css = "body{font-family:F}p::before{content:\"?\"!important;content:\"x\"}";
+        assert_eq!(
+            variant_chars("<body><p>X</p></body>", css, "F", 400, "normal"),
+            "?Xx"
+        );
+    }
+
+    #[test]
+    fn nesting_inside_functional_selectors_and_declaration_order() {
+        let css = "body{font-family:F}.a{:is(&){font-weight:700}}.b{font-weight:400;&{font-weight:700}font-weight:600}";
+        let html = "<body><div class=a>A</div><p class=b>B</p></body>";
+        assert_eq!(variant_chars(html, css, "F", 700, "normal"), "A");
+        assert_eq!(variant_chars(html, css, "F", 600, "normal"), "B");
+    }
+
+    #[test]
+    fn a_trailing_escape_does_not_panic() {
+        let css = "p:\\ {font-family:F}p.\\{font-weight:700}";
+        let _ = collect_chars_per_font("<body><p>Q</p></body>", css);
+        let _ = specificity("p:\\");
+        let _ = specificity("\\");
+    }
+
+    #[test]
+    fn attr_fallback_text_counts() {
+        let css = "body{font-family:F}p::before{content:attr(data-x,\"?\")}";
+        assert_eq!(
+            variant_chars("<body><p>X</p></body>", css, "F", 400, "normal"),
+            "?X"
+        );
+    }
+
+    #[test]
+    fn first_letter_covers_text_in_styled_descendants() {
+        let css = "body{font-family:F}p::first-letter{font-weight:700}span{font-weight:400}";
+        assert_eq!(
+            variant_chars(
+                "<body><p><span>Q?</span></p></body>",
+                css,
+                "F",
+                700,
+                "normal"
+            ),
+            "?Q"
+        );
     }
 
     #[test]
