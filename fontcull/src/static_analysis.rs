@@ -410,31 +410,45 @@ fn possible_winners<'a, T: Copy + PartialEq>(
     value: impl Fn(&'a FontStyleRule) -> Option<(T, bool)>,
     reverts_layer: impl Fn(T) -> bool,
 ) -> Vec<Option<T>> {
-    possible_winners_among(rules, &value, &reverts_layer, &|_| true)
-}
-
-/// The possible winners among declarations whose priority `allowed` admits.
-fn possible_winners_among<'a, T: Copy + PartialEq>(
-    rules: &[&'a FontStyleRule],
-    value: &dyn Fn(&'a FontStyleRule) -> Option<(T, bool)>,
-    reverts_layer: &dyn Fn(T) -> bool,
-    allowed: &dyn Fn(&Priority) -> bool,
-) -> Vec<Option<T>> {
-    // (priority, value, conditional, scoped)
+    // Every declaration once: (priority, value, conditional, scoped).
     let declarations: Vec<(Priority, T, bool, bool)> = rules
         .iter()
         .filter_map(|rule| {
             let (v, important) = value(rule)?;
-            let p = rule.priority(important);
-            allowed(&p).then_some((p, v, rule.conditional, rule.scoped))
+            Some((rule.priority(important), v, rule.conditional, rule.scoped))
         })
         .collect();
-    let base = declarations
+    let mut memo = HashMap::new();
+    possible_winners_below(&declarations, &reverts_layer, None, &mut memo)
+}
+
+/// (importance, inline, layer order): a `revert-layer` rollback admits declarations
+/// strictly below its own cutoff in cascade order.
+type Cutoff = (bool, bool, Vec<u32>);
+
+/// The possible winners among declarations below `cutoff` (all of them for `None`).
+/// Results are memoized by cutoff, so chains of `revert-layer` across many layers stay
+/// linear in the number of cutoffs instead of exponential.
+fn possible_winners_below<T: Copy + PartialEq>(
+    declarations: &[(Priority, T, bool, bool)],
+    reverts_layer: &dyn Fn(T) -> bool,
+    cutoff: Option<&Cutoff>,
+    memo: &mut HashMap<Option<Cutoff>, Vec<Option<T>>>,
+) -> Vec<Option<T>> {
+    let key = cutoff.cloned();
+    if let Some(winners) = memo.get(&key) {
+        return winners.clone();
+    }
+    let below = |p: &Priority| cutoff.is_none_or(|(i, n, l)| (p.0, p.1, &p.2) < (*i, *n, l));
+    let admitted: Vec<&(Priority, T, bool, bool)> =
+        declarations.iter().filter(|d| below(&d.0)).collect();
+    let base = admitted
         .iter()
-        .filter(|declaration| !declaration.2)
-        .max_by(|a, b| a.0.cmp(&b.0));
+        .filter(|d| !d.2)
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .copied();
     let mut winners: Vec<Option<T>> = Vec::new();
-    let mut push = |candidate: Option<T>| {
+    let push = |winners: &mut Vec<Option<T>>, candidate: Option<T>| {
         if !winners.contains(&candidate) {
             winners.push(candidate);
         }
@@ -443,30 +457,30 @@ fn possible_winners_among<'a, T: Copy + PartialEq>(
     // everything below its layer in cascade order: lower layers of the same importance,
     // then (for !important) every normal declaration; an inline style rolls back to the
     // stylesheets. The user-agent value (None) when there are none.
-    let roll_back = |p: &Priority, push: &mut dyn FnMut(Option<T>)| {
-        let (important, inline, layer) = (p.0, p.1, p.2.clone());
-        let lower = move |q: &Priority| (q.0, q.1, &q.2) < (important, inline, &layer);
-        for candidate in possible_winners_among(rules, value, reverts_layer, &lower) {
-            push(candidate);
+    let mut roll_back = |p: &Priority, winners: &mut Vec<Option<T>>| {
+        let lower: Cutoff = (p.0, p.1, p.2.clone());
+        for candidate in possible_winners_below(declarations, reverts_layer, Some(&lower), memo) {
+            push(winners, candidate);
         }
     };
     match base {
-        Some((p, v, _, _)) if reverts_layer(*v) => roll_back(p, &mut push),
-        Some((_, v, _, _)) => push(Some(*v)),
-        None => push(None),
+        Some((p, v, _, _)) if reverts_layer(*v) => roll_back(p, &mut winners),
+        Some((_, v, _, _)) => push(&mut winners, Some(*v)),
+        None => push(&mut winners, None),
     }
-    let base_priority = base.map(|(p, _, _, _)| p.clone());
-    for (p, v, _, scoped) in declarations.iter().filter(|declaration| declaration.2) {
+    let base_priority = base.map(|(p, _, _, _)| p);
+    for (p, v, _, scoped) in admitted.iter().copied().filter(|d| d.2) {
         // (scoped rules are always possible winners: proximity can beat source order)
-        if !(*scoped || base_priority.as_ref().is_none_or(|best| p > best)) {
+        if !(*scoped || base_priority.is_none_or(|best| p > best)) {
             continue;
         }
         if reverts_layer(*v) {
-            roll_back(p, &mut push);
+            roll_back(p, &mut winners);
         } else {
-            push(Some(*v));
+            push(&mut winners, Some(*v));
         }
     }
+    memo.insert(key, winners.clone());
     winners
 }
 
@@ -933,6 +947,7 @@ impl ParsedCss {
 
 /// Parse CSS and extract rules that set font-family, font-weight, font-style or the
 /// `content` of `::before`/`::after`, with CSS variable resolution.
+#[cfg_attr(not(test), allow(dead_code))] // (the tests read parsed rules)
 fn parse_font_style_rules_with_vars(css: &str, css_vars: &CssVariables) -> Vec<FontStyleRule> {
     parse_css_rules(css, css_vars).rules
 }
@@ -2594,6 +2609,43 @@ mod tests {
         let css = "body{font-family:F}p{font-family:Sheet}";
         let html = "<body><p style=\"font-family:revert-layer!important\">Q</p></body>";
         assert_eq!(variant_chars(html, css, "Sheet", 400, "normal"), "Q");
+    }
+
+    #[test]
+    fn chained_conditional_revert_layers_stay_fast() {
+        // 20 layers, each with a conditional revert-layer and a normal weight: the
+        // rollbacks share their lower-layer results instead of recomputing them.
+        let mut css = String::from("body{font-family:F}@layer ");
+        css.push_str(
+            &(0..20)
+                .map(|i| format!("l{i}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        css.push(';');
+        for i in 0..20 {
+            css.push_str(&format!(
+                "@layer l{i}{{p{{font-weight:{}}}@media(min-width:{i}px){{p{{font-weight:revert-layer}}}}}}",
+                100 + i * 10
+            ));
+        }
+        let html = format!("<body>{}</body>", "<p>Q</p>".repeat(50));
+        let started = std::time::Instant::now();
+        let (_, variants) = collect_chars_per_font(&html, &css);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        // every layer's weight is a possible font (each revert-layer can roll back)
+        for i in 0..20 {
+            let key = FontVariantKey {
+                family: "F".to_string(),
+                weight: 100 + i * 10,
+                style: "normal".to_string(),
+            };
+            assert!(variants.contains_key(&key), "weight {}", 100 + i * 10);
+        }
     }
 
     #[test]
