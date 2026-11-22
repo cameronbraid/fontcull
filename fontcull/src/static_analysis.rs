@@ -203,22 +203,45 @@ pub fn collect_chars_per_font(
             }
         }
 
-        // ::first-letter/::first-line style the start of the element's text, which may
-        // be inside descendants: conservatively count all of it in their font.
-        let first_text: Vec<&FontStyleRule> = pseudo_rules
-            .iter()
-            .copied()
-            .filter(|rule| {
-                rule.pseudo == Some(PseudoElement::FirstText) && rule.selector_matches(&element)
-            })
-            .collect();
-        if !first_text.is_empty() {
+        // ::first-line and ::first-letter style the start of the element's text, which
+        // may be inside descendants: conservatively count all of it in their fonts. The
+        // first letter inherits from the first line, which inherits from the element.
+        let matching_pseudo = |kind: PseudoElement| -> Vec<&FontStyleRule> {
+            pseudo_rules
+                .iter()
+                .copied()
+                .filter(|rule| rule.pseudo == Some(kind) && rule.selector_matches(&element))
+                .collect()
+        };
+        let first_line = matching_pseudo(PseudoElement::FirstLine);
+        let first_letter = matching_pseudo(PseudoElement::FirstLetter);
+        if !first_line.is_empty() || !first_letter.is_empty() {
             let text: String = element.text().collect();
             if !text.trim().is_empty() {
-                let transform = first_text
-                    .iter()
-                    .fold(transform, |transform, rule| transform | rule.text_transform);
-                add(&cascade(&styles, None, &first_text), &text, transform);
+                let mut letter_parents = styles.clone();
+                if !first_line.is_empty() {
+                    let line_styles = cascade(&styles, None, &first_line);
+                    let line_transform = first_line
+                        .iter()
+                        .fold(transform, |transform, rule| transform | rule.text_transform);
+                    add(&line_styles, &text, line_transform);
+                    for style in line_styles {
+                        if !letter_parents.contains(&style) {
+                            letter_parents.push(style);
+                        }
+                    }
+                }
+                if !first_letter.is_empty() {
+                    let letter_transform = first_letter
+                        .iter()
+                        .chain(&first_line)
+                        .fold(transform, |transform, rule| transform | rule.text_transform);
+                    add(
+                        &cascade(&letter_parents, None, &first_letter),
+                        &text,
+                        letter_transform,
+                    );
+                }
             }
         }
 
@@ -263,9 +286,10 @@ enum PseudoElement {
     Before,
     After,
     Marker,
-    /// `::first-letter`/`::first-line`: restyles part of the element's (and its
-    /// descendants') text.
-    FirstText,
+    /// `::first-line`: restyles the start of the element's (and its descendants') text.
+    FirstLine,
+    /// `::first-letter`: restyles its first letter; it inherits from `::first-line`.
+    FirstLetter,
 }
 
 /// Uppercase or lowercase forms a `text-transform` can add.
@@ -311,8 +335,9 @@ struct FontStyleRule {
     /// Inside `@media`/`@supports`/`@container`/`@scope`, or matching only in an
     /// interaction state: the rule may or may not apply.
     conditional: bool,
-    /// The rank of its `@layer` (by first appearance), or `None` when unlayered.
-    layer: Option<u32>,
+    /// Its `@layer`'s position: the sibling index at each nesting level (empty when
+    /// unlayered).
+    layer: Vec<u32>,
     /// Inside `@scope`: scope proximity can make it win over later rules, so it is
     /// always a possible winner.
     scoped: bool,
@@ -333,19 +358,29 @@ impl FontStyleRule {
     /// Cascade order of one of this rule's declarations: importance, inline style,
     /// cascade layer, specificity, source order.
     fn priority(&self, important: bool) -> Priority {
-        // Unlayered normal declarations beat layered ones and later layers beat earlier
-        // ones; both reverse for important declarations.
-        let layer = match (important, self.layer) {
-            (false, None) => u32::MAX,
-            (false, Some(rank)) => rank,
-            (true, None) => 0,
-            (true, Some(rank)) => u32::MAX - rank,
-        };
-        (important, self.inline, layer, self.specificity, self.order)
+        (
+            important,
+            self.inline,
+            self.layer_order(important),
+            self.specificity,
+            self.order,
+        )
+    }
+
+    /// Layer order, compared lexicographically: later sibling layers win, and a layer's
+    /// own declarations (the trailing `u32::MAX`) beat its sublayers, as unlayered
+    /// declarations beat every layer. Important declarations reverse the order.
+    fn layer_order(&self, important: bool) -> Vec<u32> {
+        self.layer
+            .iter()
+            .copied()
+            .chain([u32::MAX])
+            .map(|index| if important { u32::MAX - index } else { index })
+            .collect()
     }
 }
 
-type Priority = (bool, bool, u32, (u32, u32, u32), usize);
+type Priority = (bool, bool, Vec<u32>, (u32, u32, u32), usize);
 
 /// The user-agent origin's font for an element of `tag`, inheriting `parent`.
 fn user_agent_style(parent: &ResolvedFontStyle, tag: Option<&str>) -> ResolvedFontStyle {
@@ -373,23 +408,45 @@ fn user_agent_style(parent: &ResolvedFontStyle, tag: Option<&str>) -> ResolvedFo
 fn possible_winners<'a, T: Copy + PartialEq>(
     rules: &[&'a FontStyleRule],
     value: impl Fn(&'a FontStyleRule) -> Option<(T, bool)>,
+    reverts_layer: impl Fn(T) -> bool,
 ) -> Vec<Option<T>> {
-    let mut base: Option<(Priority, T)> = None;
-    for rule in rules.iter().filter(|rule| !rule.conditional) {
-        if let Some((v, important)) = value(rule) {
-            let p = rule.priority(important);
-            if base.is_none_or(|(best, _)| p > best) {
-                base = Some((p, v));
+    // The highest-priority unconditional declaration among those `allowed` admits.
+    let winner = |allowed: &dyn Fn(&Priority) -> bool| -> Option<(Priority, T)> {
+        let mut best: Option<(Priority, T)> = None;
+        for rule in rules.iter().filter(|rule| !rule.conditional) {
+            if let Some((v, important)) = value(rule) {
+                let p = rule.priority(important);
+                if allowed(&p) && best.as_ref().is_none_or(|(b, _)| p > *b) {
+                    best = Some((p, v));
+                }
             }
         }
-    }
-    let mut winners = vec![base.map(|(_, v)| v)];
+        best
+    };
+    // revert-layer rolls back to the winner among lower layers of the same importance.
+    let roll_back = |mut found: Option<(Priority, T)>| -> Option<T> {
+        while let Some((p, v)) = &found {
+            if !reverts_layer(*v) {
+                return Some(*v);
+            }
+            let (important, layer) = (p.0, p.2.clone());
+            found = winner(&|q: &Priority| q.0 == important && q.2 < layer);
+        }
+        None
+    };
+    let base = winner(&|_| true);
+    let base_priority = base.as_ref().map(|(p, _)| p.clone());
+    let mut winners = vec![roll_back(base)];
     for rule in rules.iter().filter(|rule| rule.conditional) {
-        if let Some((v, important)) = value(rule)
-            && (rule.scoped || base.is_none_or(|(best, _)| rule.priority(important) > best))
-            && !winners.contains(&Some(v))
-        {
-            winners.push(Some(v));
+        if let Some((v, important)) = value(rule) {
+            let p = rule.priority(important);
+            if !(rule.scoped || base_priority.as_ref().is_none_or(|best| p > *best)) {
+                continue;
+            }
+            let candidate = roll_back(Some((p, v)));
+            if !winners.contains(&candidate) {
+                winners.push(candidate);
+            }
         }
     }
     winners
@@ -402,20 +459,33 @@ fn cascade(
     tag: Option<&str>,
     rules: &[&FontStyleRule],
 ) -> Vec<ResolvedFontStyle> {
-    let families = possible_winners(rules, |rule| {
-        rule.font_family
-            .as_deref()
-            .map(|family| (family, rule.family_important))
-    });
-    let weights = possible_winners(rules, |rule| {
-        rule.font_weight
-            .map(|weight| (weight, rule.weight_important))
-    });
-    let font_styles = possible_winners(rules, |rule| {
-        rule.font_style
-            .as_deref()
-            .map(|style| (style, rule.style_important))
-    });
+    let reverts = |value: &str| css_wide_keyword(value) == Some(CssWideKeyword::RevertLayer);
+    let families = possible_winners(
+        rules,
+        |rule| {
+            rule.font_family
+                .as_deref()
+                .map(|family| (family, rule.family_important))
+        },
+        reverts,
+    );
+    let weights = possible_winners(
+        rules,
+        |rule| {
+            rule.font_weight
+                .map(|weight| (weight, rule.weight_important))
+        },
+        |weight| weight == FontWeightValue::Keyword(CssWideKeyword::RevertLayer),
+    );
+    let font_styles = possible_winners(
+        rules,
+        |rule| {
+            rule.font_style
+                .as_deref()
+                .map(|style| (style, rule.style_important))
+        },
+        reverts,
+    );
 
     let mut out: Vec<ResolvedFontStyle> = Vec::new();
     for parent in parents {
@@ -424,13 +494,18 @@ fn cascade(
             let font_family = match family.map(|f| (f, css_wide_keyword(f))) {
                 None => ua.font_family.clone(),
                 Some((_, Some(CssWideKeyword::Inherit))) => parent.font_family.clone(),
-                Some((_, Some(CssWideKeyword::Revert))) => ua.font_family.clone(),
+                Some((_, Some(CssWideKeyword::Revert | CssWideKeyword::RevertLayer))) => {
+                    ua.font_family.clone()
+                }
                 Some((_, Some(CssWideKeyword::Initial))) => "serif".to_string(),
                 Some((family, None)) => family.to_string(),
             };
             for weight in &weights {
                 let font_weight = match weight {
-                    None | Some(FontWeightValue::Keyword(CssWideKeyword::Revert)) => ua.font_weight,
+                    None
+                    | Some(FontWeightValue::Keyword(
+                        CssWideKeyword::Revert | CssWideKeyword::RevertLayer,
+                    )) => ua.font_weight,
                     Some(FontWeightValue::Absolute(weight)) => *weight,
                     Some(FontWeightValue::Bolder) => bolder(parent.font_weight),
                     Some(FontWeightValue::Lighter) => lighter(parent.font_weight),
@@ -439,7 +514,10 @@ fn cascade(
                 };
                 for style in &font_styles {
                     let font_style = match style.map(|s| (s, css_wide_keyword(s))) {
-                        None | Some((_, Some(CssWideKeyword::Revert))) => ua.font_style.clone(),
+                        None
+                        | Some((_, Some(CssWideKeyword::Revert | CssWideKeyword::RevertLayer))) => {
+                            ua.font_style.clone()
+                        }
                         Some((_, Some(CssWideKeyword::Inherit))) => parent.font_style.clone(),
                         Some((_, Some(CssWideKeyword::Initial))) => "normal".to_string(),
                         Some((style, None)) => style.to_string(),
@@ -486,9 +564,11 @@ fn lighter(parent: u16) -> u16 {
 enum CssWideKeyword {
     /// `inherit`, and `unset`, which inherits for these inherited properties.
     Inherit,
-    /// `revert`: the user-agent origin's value. (`revert-layer` declarations are dropped
-    /// at parse time, so the next lower declaration wins.)
+    /// `revert`: the user-agent origin's value.
     Revert,
+    /// `revert-layer`: the value from lower cascade layers (resolved in
+    /// `possible_winners`; the user-agent value when no lower layer sets one).
+    RevertLayer,
     Initial,
 }
 
@@ -496,6 +576,7 @@ fn css_wide_keyword(value: &str) -> Option<CssWideKeyword> {
     match value.trim().to_ascii_lowercase().as_str() {
         "inherit" | "unset" => Some(CssWideKeyword::Inherit),
         "revert" => Some(CssWideKeyword::Revert),
+        "revert-layer" => Some(CssWideKeyword::RevertLayer),
         "initial" => Some(CssWideKeyword::Initial),
         _ => None,
     }
@@ -729,24 +810,45 @@ struct ParsedCss {
     rules: Vec<FontStyleRule>,
     /// Characters of every `quotes` declaration.
     quote_chars: String,
-    /// Cascade layer names in order of first appearance; a layer's rank is its index + 1.
-    layers: Vec<String>,
+    /// Each layer's child layer names, by the parent's full name ("" for the top level),
+    /// in order of first appearance.
+    layer_children: HashMap<String, Vec<String>>,
+    /// Anonymous layers seen, for unique names.
+    anonymous_layers: usize,
     /// Characters of every string `list-style-type` marker.
     marker_chars: String,
 }
 
 impl ParsedCss {
-    fn layer_rank(&mut self, name: &str) -> u32 {
-        let index = match self.layers.iter().position(|layer| layer == name) {
-            Some(index) => index,
-            None => {
-                self.layers.push(name.to_string());
-                self.layers.len() - 1
+    /// The sibling index at each level of a full layer name (`a.inner` →
+    /// [index of `a`, index of `inner` within `a`]), registering new layers in order.
+    fn layer_position(&mut self, name: &str) -> Vec<u32> {
+        let mut position = Vec::new();
+        let mut parent = String::new();
+        for part in name
+            .split('.')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
+            let children = self.layer_children.entry(parent.clone()).or_default();
+            let index = match children.iter().position(|child| child == part) {
+                Some(index) => index,
+                None => {
+                    children.push(part.to_string());
+                    children.len() - 1
+                }
+            };
+            position.push(
+                u32::try_from(index)
+                    .unwrap_or(u32::MAX - 1)
+                    .min(u32::MAX - 1),
+            );
+            if !parent.is_empty() {
+                parent.push('.');
             }
-        };
-        u32::try_from(index + 1)
-            .unwrap_or(u32::MAX - 1)
-            .min(u32::MAX - 1)
+            parent.push_str(part);
+        }
+        position
     }
 
     /// The context inside an at-rule block, or `None` for at-rules whose contents are
@@ -768,12 +870,13 @@ impl ParsedCss {
             "layer" => {
                 let name = at_rule[name_end..].trim();
                 let name = if name.is_empty() {
-                    format!("\0anonymous{}", self.layers.len())
+                    self.anonymous_layers += 1;
+                    format!("\0anonymous{}", self.anonymous_layers)
                 } else {
                     name.to_string()
                 };
                 let full = self.layer_name(context, &name);
-                self.layer_rank(&full);
+                self.layer_position(&full);
                 Some(Context {
                     layer: Some(full),
                     ..context.clone()
@@ -798,12 +901,15 @@ impl ParsedCss {
             .filter(|name| !name.is_empty())
         {
             let full = self.layer_name(context, name);
-            self.layer_rank(&full);
+            self.layer_position(&full);
         }
     }
 
-    fn rank_of(&mut self, context: &Context) -> Option<u32> {
-        context.layer.clone().map(|layer| self.layer_rank(&layer))
+    fn position_of(&mut self, context: &Context) -> Vec<u32> {
+        match context.layer.clone() {
+            Some(layer) => self.layer_position(&layer),
+            None => Vec::new(),
+        }
     }
 }
 
@@ -820,7 +926,8 @@ fn parse_css_rules(css: &str, css_vars: &CssVariables) -> ParsedCss {
     let mut parsed = ParsedCss {
         rules: Vec::new(),
         quote_chars: String::new(),
-        layers: Vec::new(),
+        layer_children: HashMap::new(),
+        anonymous_layers: 0,
         marker_chars: String::new(),
     };
     let css = strip_css_comments(css);
@@ -1031,12 +1138,6 @@ fn parse_declarations(
         {
             value = value[..bang].trim_end();
             important = true;
-        }
-        if resolve_css_var(value, css_vars)
-            .trim()
-            .eq_ignore_ascii_case("revert-layer")
-        {
-            continue; // the next lower declaration wins
         }
         match name.as_str() {
             "font-family" => {
@@ -1252,7 +1353,7 @@ fn push_rule(
     };
     let pseudo = match target {
         Target::Pseudo(pseudo) => Some(pseudo),
-        Target::PartOfText => Some(PseudoElement::FirstText),
+        Target::PartOfText(pseudo) => Some(pseudo),
         Target::Element => None,
     };
     let generates = matches!(
@@ -1277,7 +1378,7 @@ fn push_rule(
         state_dependent = true;
     }
     let order = parsed.rules.len();
-    let layer = parsed.rank_of(context);
+    let layer = parsed.position_of(context);
     parsed.rules.push(FontStyleRule {
         specificity: specificity(&base),
         parsed: selectors,
@@ -1319,7 +1420,7 @@ fn inline_style_rule(style: &str, css_vars: &CssVariables) -> Option<FontStyleRu
         text_transform: declarations.text_transform,
         pseudo: None,
         conditional: false,
-        layer: None,
+        layer: Vec::new(),
         scoped: false,
         inline: true,
         specificity: (0, 0, 0),
@@ -1334,7 +1435,7 @@ enum Target {
     Element,
     Pseudo(PseudoElement),
     /// `::first-letter`/`::first-line`: part of the element's own text.
-    PartOfText,
+    PartOfText(PseudoElement),
 }
 
 /// Split a trailing pseudo-element off a selector: `::before`, `::after` and
@@ -1346,12 +1447,18 @@ fn split_pseudo_element(selector: &str) -> (Option<String>, Target) {
         ("::before", Target::Pseudo(PseudoElement::Before)),
         ("::after", Target::Pseudo(PseudoElement::After)),
         ("::marker", Target::Pseudo(PseudoElement::Marker)),
-        ("::first-letter", Target::PartOfText),
-        ("::first-line", Target::PartOfText),
+        (
+            "::first-letter",
+            Target::PartOfText(PseudoElement::FirstLetter),
+        ),
+        ("::first-line", Target::PartOfText(PseudoElement::FirstLine)),
         (":before", Target::Pseudo(PseudoElement::Before)),
         (":after", Target::Pseudo(PseudoElement::After)),
-        (":first-letter", Target::PartOfText),
-        (":first-line", Target::PartOfText),
+        (
+            ":first-letter",
+            Target::PartOfText(PseudoElement::FirstLetter),
+        ),
+        (":first-line", Target::PartOfText(PseudoElement::FirstLine)),
     ] {
         let Some(start) = selector.len().checked_sub(suffix.len()) else {
             continue;
@@ -2364,6 +2471,61 @@ mod tests {
             "{normal}"
         );
         assert_eq!(variant_chars(html, css, "F", 700, "normal"), "A");
+    }
+
+    #[test]
+    fn first_line_and_first_letter_each_keep_their_font() {
+        let css = "body{font-family:Karla}p::first-line{font-family:\"PT Sans\"}\
+                   p::first-letter{font-family:Unbounded}";
+        let html = "<body><p>Abc</p></body>";
+        assert_eq!(variant_chars(html, css, "PT Sans", 400, "normal"), "Abc");
+        assert_eq!(variant_chars(html, css, "Unbounded", 400, "normal"), "Abc");
+        assert_eq!(variant_chars(html, css, "Karla", 400, "normal"), "Abc");
+    }
+
+    #[test]
+    fn first_letter_inherits_from_first_line() {
+        let css =
+            "body{font-family:F}p::first-line{font-weight:700}p::first-letter{font-style:italic}";
+        assert_eq!(
+            variant_chars("<body><p>Ab</p></body>", css, "F", 700, "italic"),
+            "Ab"
+        );
+    }
+
+    #[test]
+    fn nested_layers_rank_within_their_parent() {
+        let css = "body{font-family:F}@layer a,b;@layer a{@layer inner{p{font-weight:700}}}\
+                   @layer b{p{font-weight:400}}";
+        let html = "<body><p>Q?</p></body>";
+        assert_eq!(variant_chars(html, css, "F", 400, "normal"), "?Q");
+        assert_eq!(variant_chars(html, css, "F", 700, "normal"), "");
+    }
+
+    #[test]
+    fn a_layers_own_declarations_beat_its_sublayers() {
+        let css = "body{font-family:F}@layer a{p{font-weight:600}@layer inner{p{font-weight:800}}}";
+        let html = "<body><p>Q</p></body>";
+        assert_eq!(variant_chars(html, css, "F", 600, "normal"), "Q");
+        assert_eq!(variant_chars(html, css, "F", 800, "normal"), "");
+    }
+
+    #[test]
+    fn revert_layer_rolls_back_the_whole_layer() {
+        let css = "body{font-family:F}@layer a,b;@layer a{p{font-weight:600}}\
+                   @layer b{p{font-weight:700;font-weight:revert-layer}}";
+        let html = "<body><p>Q?</p></body>";
+        assert_eq!(variant_chars(html, css, "F", 600, "normal"), "?Q");
+        assert_eq!(variant_chars(html, css, "F", 700, "normal"), "");
+    }
+
+    #[test]
+    fn revert_layer_without_a_lower_layer_uses_the_user_agent_value() {
+        let css = "body{font-family:F}@layer b{h3{font-weight:300}.r{font-weight:revert-layer}}";
+        assert_eq!(
+            variant_chars("<body><h3 class=r>H</h3></body>", css, "F", 700, "normal"),
+            "H"
+        );
     }
 
     #[test]
