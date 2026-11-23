@@ -1992,7 +1992,9 @@ pub fn extract_css_from_html(html: &str) -> String {
     let mut css = String::new();
 
     for style in document.select(&style_selector) {
-        css.push_str(&style.inner_html());
+        // The raw text: `inner_html()` re-escapes it as HTML, turning `>` into `&gt;`,
+        // whose `;` then splits selectors (`.a>p{…}` became a stray `p{…}` rule).
+        css.extend(style.text());
         css.push('\n');
     }
 
@@ -2646,6 +2648,22 @@ mod tests {
             };
             assert!(variants.contains_key(&key), "weight {}", 100 + i * 10);
         }
+    }
+
+    #[test]
+    fn inline_style_child_combinators_are_kept() {
+        // `>` in a <style> must reach the parser as `>`, not `&gt;` (whose `;` split the
+        // rule into a stray `p{font-weight:600}` that made every paragraph weight 600).
+        let html = "<html><head><style>body{font-family:Karla}.card>p{font-weight:600}\
+                    .x&y{color:red}</style></head><body><p>1¾ hours</p><div class=card><p>C</p></div></body></html>";
+        let css = extract_css_from_html(html);
+        assert!(css.contains(".card>p"), "{css}");
+        assert!(!css.contains("&gt;"), "{css}");
+        assert_eq!(
+            variant_chars(html, &css, "Karla", 400, "normal"),
+            " 1horsu¾"
+        );
+        assert_eq!(variant_chars(html, &css, "Karla", 600, "normal"), "C");
     }
 
     #[test]
